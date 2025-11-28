@@ -1,12 +1,11 @@
 🍎🍎🍎🍎🍎 뉴스 추천시스템 연구 개발 진행중 🍎🍎🍎🍎🍎
 <br/><br/>
-11.28 : PLM-NR 뉴스인코더 코드 추가
-<br/>
-      : modified:   MIND_corpus.py
-        modified:   config.py
-        modified:   main.py
-        modified:   model.py
-        modified:   newsEncoders.py
+11.28 : PLM-NR 뉴스인코더 코드 추가 <br/>
+      : modified:   MIND_corpus.py <br/>
+        modified:   config.py <br/>
+        modified:   main.py <br/>
+        modified:   model.py <br/>
+        modified:   newsEncoders.py <br/>
 
 
 
