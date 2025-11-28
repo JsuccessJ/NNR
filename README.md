@@ -1,3 +1,8 @@
+🍎🍎🍎🍎🍎 뉴스 추천시스템 연구 개발 진행중 🍎🍎🍎🍎🍎
+11.28 : PLM-NR 뉴스인코더 코드 추가
+
+
+
 This repository is for the paper [**Neural News Recommendation with Collaborative News Encoding and Structural User Encoding** (EMNLP-2021 Findings)](https://aclanthology.org/2021.findings-emnlp.5.pdf).
 <br/><br/>
 
