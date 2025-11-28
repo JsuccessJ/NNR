@@ -18,7 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Trainer:
     def __init__(self, model: nn.Module, config: Config, mind_corpus: MIND_Corpus, run_index: int):
-        self.model = model
+        self.model = model # model.py:120-133에 forward() 메서드가 있음
         self.epoch = config.epoch
         self.batch_size = config.batch_size
         self.max_history_num = config.max_history_num
@@ -103,7 +103,7 @@ class Trainer:
                 news_content_entity = news_content_entity.cuda(non_blocking=True)                                                                                               # [batch_size, 1 + negative_sample_num, max_content_length]
 
                 logits = model(user_ID, user_category, user_subCategory, user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, \
-                               news_category, news_subCategory, news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity) # [batch_size, 1 + negative_sample_num]
+                               news_category, news_subCategory, news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity) # [batch_size, 1 + negative_sample_num], # model.py:120-133에 forward() 메서드가 있음
 
                 loss = self.loss(logits)
                 if model.news_encoder.auxiliary_loss is not None:

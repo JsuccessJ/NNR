@@ -20,3 +20,26 @@
 /prediction
 /__pycache__
 /.vscode
+
+
+*.o
+*.so
+*.dylib
+general_recommendation_methods/libfm/bin/
+
+# Log files
+*.log
+
+# Environment files
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/

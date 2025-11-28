@@ -183,11 +183,11 @@ class ATT(UserEncoder):
 
     def forward(self, user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_category, user_subCategory, \
                 user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, candidate_news_representation):
-        news_num = candidate_news_representation.size(1)
+        news_num = candidate_news_representation.size(1)  # 후보 뉴스 개수 추출, 예: candidate_news_representation.shape = [64, 5, 400] → news_num = 5
         history_embedding = self.news_encoder(user_title_text, user_title_mask, user_title_entity, \
                                               user_content_text, user_content_mask, user_content_entity, \
                                               user_category, user_subCategory, user_embedding)            # [batch_size, max_history_num, news_embedding_dim]
-        user_representation = self.attention(history_embedding).unsqueeze(dim=1).expand(-1, news_num, -1) # [batch_size, news_embedding_dim]
+        user_representation = self.attention(history_embedding).unsqueeze(dim=1).expand(-1, news_num, -1) # [batch_size, news_num, news_embedding_dim], 수정함
         return user_representation
 
 
