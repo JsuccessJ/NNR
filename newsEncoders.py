@@ -6,7 +6,8 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.rnn import pad_packed_sequence
 from layers import Conv1D, Conv2D_Pool, MultiHeadAttention, Attention, ScaledDotProduct_CandidateAttention, CandidateAttention
-
+# PLM-NR
+from transformers import BertModel , RobertaModel, AutoModel
 
 class NewsEncoder(nn.Module):
     def __init__(self, config: Config):
@@ -430,4 +431,206 @@ class Inception(NewsEncoder):
         subnetwork2 = F.relu(self.fc2(embeddings), inplace=True)                                                                                   # [batch_size, news_num, embedding_dim]
         subnetwork3 = title_embedding + content_embedding + category_embedding + subCategory_embedding                                             # [batch_size, news_num, embedding_dim]
         news_representation = self.linear_transform(torch.cat([subnetwork1, subnetwork2, subnetwork3], dim=2))                                     # [batch_size, news_num, embedding_dim]
+        return news_representation
+
+
+class PLMNewsEncoder(NewsEncoder):
+    def __init__(self, config: Config):
+        super(PLMNewsEncoder, self).__init__()
+        self.config = config
+
+        # 1. PLM 로딩
+        self.plm_hidden_dim = 768 # Bert-Base hidden size
+        if config.plm_type == 'bert':
+            self.plm = BertModel.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
+            self.plm_hidden_dim = self.plm.config.hidden_size
+        elif config.plm_type == 'roberta':
+            self.plm = RobertaModel.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
+            self.plm_hidden_dim = self.plm.config.hidden_size
+        else:
+            self.plm = AutoModel.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
+            self.plm_hidden_dim = self.plm.config.hidden_size
+
+        # 2. PLM Layer Freezing (마지막 N개 레이어만 학습)
+        self._freeze_plm_layers(config.plm_frozen_layers)
+
+        # 3. Pooling -> attention
+        self.pooling_method = config.plm_pooling
+        if self.pooling_method == 'attention':
+            self.attention = Attention(hidden_dim=self.plm_hidden_dim, attention_dim=config.attention_dim)
+        
+        # 4. Dropout 설정
+        self.dropout =  nn.Dropout(p=config.dropout_rate, inplace=False)
+
+        # 5. Auxiliary loss
+        self.auxiliary_loss = None
+    
+    def _freeze_plm_layers(self, frozen_layers):
+        """PLM의 하위 레이어 frozen"""
+        if frozen_layers == 0:
+            # 전체 fine-tune
+            return
+
+        # BERT/RoBERTa 구조: encoder.layer.0 ~ encoder.layer.11 총 12개층으로 구성됨
+        total_layers = len(self.plm.encoder.layer)
+
+        for layer_idx in range(frozen_layers):
+            for param in self.plm.encoder.layer[layer_idx].parameters():
+                param.requires_grad = False
+
+        print(f'Frozen {frozen_layers} layers out of {total_layers} in PLM')
+
+    def _pool_hidden_states(self, hidden_states, attention_mask):
+        """
+        PLM hidden states를 news embedding으로 pooling
+
+        Args:
+            hidden_states: [batch_news_num, seq_len, hidden_dim]
+            attention_mask: [batch_news_num, seq_len]
+
+        Returns:
+            news_embedding: [batch_news_num, hidden_dim]
+        """
+        if self.pooling_method == 'cls':
+            # [CLS] 토큰의 representation 사용, hidden_states: [batch_news_num, seq_len, hidden_dim] -> [B*N, hidden_dim]
+            news_embedding = hidden_states[:, 0, :]  # [B*N, hidden_dim]
+
+        elif self.pooling_method == 'average':
+            # Attention mask를 고려한 평균
+            mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+            sum_hidden = torch.sum(hidden_states * mask_expanded, dim=1)  # [B*N, hidden_dim]
+            sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+            news_embedding = sum_hidden / sum_mask
+
+        elif self.pooling_method == 'attention':
+            # Attention 메커니즘
+            news_embedding = self.attention(hidden_states, mask=attention_mask)  # [B*N, hidden_dim]
+
+        else:
+            raise ValueError(f'Unknown pooling method: {self.pooling_method}')
+
+        return news_embedding
+
+    def initialize(self):
+        """파라미터 초기화"""
+        if self.pooling_method == 'attention':
+            self.attention.initialize()
+
+    def forward(self, title_text, title_mask, title_entity, content_text, content_mask, content_entity, category, subCategory, user_embedding):
+        raise NotImplementedError('Subclass must implement forward()')
+
+
+class PLMNAML(PLMNewsEncoder):
+    """
+    PLM-empowered NAML
+    - PLM for title encoding
+    - Category/SubCategory fusion
+    """
+
+    def __init__(self, config: Config):
+        super(PLMNAML, self).__init__(config)
+
+        # Category embeddings
+        self.category_embedding = nn.Embedding(
+            num_embeddings=config.category_num,
+            embedding_dim=config.category_embedding_dim
+        )
+        self.subCategory_embedding = nn.Embedding(
+            num_embeddings=config.subCategory_num,
+            embedding_dim=config.subCategory_embedding_dim
+        )
+
+        # News embedding dimension
+        self.news_embedding_dim = (
+            self.plm_hidden_dim +
+            config.category_embedding_dim +
+            config.subCategory_embedding_dim
+        )
+
+    def initialize(self):
+        super().initialize()
+        nn.init.uniform_(self.category_embedding.weight, -0.1, 0.1)
+        nn.init.uniform_(self.subCategory_embedding.weight, -0.1, 0.1)
+        nn.init.zeros_(self.subCategory_embedding.weight[0])
+
+    def forward(self, title_text, title_mask, title_entity, content_text, content_mask, content_entity, category, subCategory, user_embedding):
+        """
+        Args:
+            title_text: [batch_size, news_num, max_title_length] - PLM token IDs
+            title_mask: [batch_size, news_num, max_title_length] - PLM attention mask
+            category: [batch_size, news_num]
+            subCategory: [batch_size, news_num]
+
+        Returns:
+            news_representation: [batch_size, news_num, news_embedding_dim]
+        """
+        batch_size = title_text.size(0)
+        news_num = title_text.size(1)
+        max_title_length = title_text.size(2)
+        batch_news_num = batch_size * news_num
+
+        # 1. Reshape for PLM
+        title_text = title_text.view([batch_news_num, max_title_length])
+        title_mask = title_mask.view([batch_news_num, max_title_length])
+
+        # 2. PLM encoding
+        plm_output = self.plm(
+            input_ids=title_text,
+            attention_mask=title_mask,
+            return_dict=True
+        )
+        hidden_states = plm_output.last_hidden_state  # [B*N, seq_len, 768]
+
+        # 3. Pooling
+        news_repr = self._pool_hidden_states(hidden_states, title_mask)  # [B*N, 768]
+        news_repr = self.dropout(news_repr)
+        news_repr = news_repr.view([batch_size, news_num, self.plm_hidden_dim])
+
+        # 4. Category fusion
+        category_repr = self.dropout(self.category_embedding(category))  # [B, N, cat_dim]
+        subCategory_repr = self.dropout(self.subCategory_embedding(subCategory))  # [B, N, subcat_dim]
+
+        # 5. Concatenation
+        news_representation = torch.cat([
+            news_repr,
+            category_repr,
+            subCategory_repr
+        ], dim=2)  # [B, N, 768+50+50=868]
+
+        return news_representation
+
+
+class PLMNRMS(PLMNewsEncoder):
+    """
+    PLM-empowered NRMS
+    - PLM only (no category fusion)
+    """
+
+    def __init__(self, config: Config):
+        super(PLMNRMS, self).__init__(config)
+        self.news_embedding_dim = self.plm_hidden_dim
+
+    def forward(self, title_text, title_mask, title_entity, content_text, content_mask, content_entity, category, subCategory, user_embedding):
+        batch_size = title_text.size(0)
+        news_num = title_text.size(1)
+        max_title_length = title_text.size(2)
+        batch_news_num = batch_size * news_num
+
+        # 1. Reshape
+        title_text = title_text.view([batch_news_num, max_title_length])
+        title_mask = title_mask.view([batch_news_num, max_title_length])
+
+        # 2. PLM encoding
+        plm_output = self.plm(
+            input_ids=title_text,
+            attention_mask=title_mask,
+            return_dict=True
+        )
+        hidden_states = plm_output.last_hidden_state
+
+        # 3. Pooling
+        news_repr = self._pool_hidden_states(hidden_states, title_mask)
+        news_repr = self.dropout(news_repr)
+        news_representation = news_repr.view([batch_size, news_num, self.plm_hidden_dim])
+
         return news_representation

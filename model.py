@@ -10,6 +10,13 @@ import variantEncoders
 class Model(nn.Module):
     def __init__(self, config: Config):
         super(Model, self).__init__()
+        if config.use_plm_news_encoder:
+            if config.new_encoder == 'NAML':
+                self.news_encoder = newsEncoders.PLMNAML(config)
+            elif config.news_encoder == 'NRMS':
+                self.news_encoder = newsEncoders.PLMNRMS(config)
+            else:
+                raise Exception(f'PLM-{config.news_encoder} is not implemented')
         # For main experiments of news encoding
         if config.news_encoder == 'CNE':
             self.news_encoder = newsEncoders.CNE(config)

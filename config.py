@@ -22,7 +22,7 @@ class Config:
         parser.add_argument('--seed', type=int, default=0, help='Seed for random number generator')
         parser.add_argument('--config_file', type=str, default='', help='Config file path')
         # Dataset config
-        parser.add_argument('--dataset', type=str, default='200k', choices=['200k', 'small', 'large'], help='Dataset type')
+        parser.add_argument('--dataset', type=str, default='small', choices=['200k', 'small', 'large'], help='Dataset type')
         parser.add_argument('--tokenizer', type=str, default='MIND', choices=['MIND', 'NLTK'], help='Sentence tokenizer')
         parser.add_argument('--word_threshold', type=int, default=3, help='Word threshold')
         parser.add_argument('--max_title_length', type=int, default=32, help='Sentence truncate length for title')
@@ -74,6 +74,15 @@ class Config:
         parser.add_argument('--OMAP_head_num', type=int, default=3, help='Head num of OMAP for Hi-Fi Ark')
         parser.add_argument('--HiFi_Ark_regularizer_coefficient', type=float, default=0.1, help='Coefficient of regularization loss for Hi-Fi Ark')
         parser.add_argument('--click_predictor', type=str, default='dot_product', choices=['dot_product', 'mlp', 'sigmoid', 'FIM'], help='Click predictor')
+        # PLM-NR config
+        parser.add_argument('--plm_type', type=str, default='bert',choices=['bert', 'roberta', 'unilm', 'none'], help='Pre-trained Language Model type')
+        parser.add_argument('--plm_model_name', type=str, default='bert-base-uncased',help='Specific PLM model name from HuggingFace')
+        parser.add_argument('--plm_frozen_layers', type=int, default=10, help='Number of PLM layers to freeze (0=fine-tune all)')
+        parser.add_argument('--plm_lr', type=float, default=1e-5,help='Learning rate for PLM fine-tuning')
+        parser.add_argument('--plm_pooling', type=str, default='attention',choices=['cls', 'average', 'attention'],help='Pooling method for PLM hidden states')
+        parser.add_argument('--use_plm_news_encoder', action='store_true', help='Use PLM-based news encoder')
+
+
 
         self.attribute_dict = dict(vars(parser.parse_args()))
         for attribute in self.attribute_dict:
@@ -131,10 +140,10 @@ class Config:
 
 
     def preliminary_setup(self):
-        dataset_files = [
-            self.train_root + '/news.tsv', self.train_root + '/behaviors.tsv', self.train_root + '/entity_embedding.vec', self.train_root + '/context_embedding.vec', 
-            self.dev_root + '/news.tsv', self.dev_root + '/behaviors.tsv', self.dev_root + '/entity_embedding.vec', self.dev_root + '/context_embedding.vec', 
-            self.test_root + '/news.tsv', self.test_root + '/behaviors.tsv', self.test_root + '/entity_embedding.vec', self.test_root + '/context_embedding.vec'
+        dataset_files = [  # _raw로 변경함(포맷)
+            self.train_root + '/news_raw.tsv', self.train_root + '/behaviors_raw.tsv', self.train_root + '/entity_embedding.vec', self.train_root + '/context_embedding.vec', 
+            self.dev_root + '/news_raw.tsv', self.dev_root + '/behaviors_raw.tsv', self.dev_root + '/entity_embedding.vec', self.dev_root + '/context_embedding.vec', 
+            self.test_root + '/news_raw.tsv', self.test_root + '/behaviors_raw.tsv', self.test_root + '/entity_embedding.vec', self.test_root + '/context_embedding.vec'
         ]
         if not all(list(map(os.path.exists, dataset_files))):
             exec('prepare_MIND_%s()' % self.dataset)
@@ -156,7 +165,7 @@ class Config:
         mkdirs(self.test_res_dir)
         mkdirs(self.result_dir)
         if not os.path.exists('dev/ref/truth-%s.txt' % self.dataset):
-            with open(os.path.join(self.dev_root, 'behaviors.tsv'), 'r', encoding='utf-8') as dev_f:
+            with open(os.path.join(self.dev_root, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as dev_f:
                 with open('dev/ref/truth-%s.txt' % self.dataset, 'w', encoding='utf-8') as truth_f:
                     for dev_ID, line in enumerate(dev_f):
                         impression_ID, user_ID, time, history, impressions = line.split('\t')
@@ -164,7 +173,7 @@ class Config:
                         truth_f.write(('' if dev_ID == 0 else '\n') + str(dev_ID + 1) + ' ' + str(labels).replace(' ', ''))
         if self.dataset != 'large':
             if not os.path.exists('test/ref/truth-%s.txt' % self.dataset):
-                with open(os.path.join(self.test_root, 'behaviors.tsv'), 'r', encoding='utf-8') as test_f:
+                with open(os.path.join(self.test_root, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as test_f:
                     with open('test/ref/truth-%s.txt' % self.dataset, 'w', encoding='utf-8') as truth_f:
                         for test_ID, line in enumerate(test_f):
                             impression_ID, user_ID, time, history, impressions = line.split('\t')

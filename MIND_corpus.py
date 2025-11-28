@@ -46,7 +46,7 @@ class MIND_Corpus:
             news_category_dict = {}
 
             # 1. user ID dictionay
-            with open(os.path.join(config.train_root, 'behaviors.tsv'), 'r', encoding='utf-8') as train_behaviors_f:
+            with open(os.path.join(config.train_root, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as train_behaviors_f:
                 for line in train_behaviors_f:
                     impression_ID, user_ID, time, history, impressions = line.split('\t')
                     if user_ID not in user_ID_dict:
@@ -56,7 +56,7 @@ class MIND_Corpus:
 
             # 2. news ID dictionay & news category dictionay & news subCategory dictionay
             for i, prefix in enumerate([config.train_root, config.dev_root, config.test_root]):
-                with open(os.path.join(prefix, 'news.tsv'), 'r', encoding='utf-8') as news_f:
+                with open(os.path.join(prefix, 'news_raw.tsv'), 'r', encoding='utf-8') as news_f:
                     for line in news_f:
                         news_ID, category, subCategory, title, abstract, _, title_entities, abstract_entities = line.split('\t')
                         if news_ID not in news_ID_dict:
@@ -112,9 +112,9 @@ class MIND_Corpus:
 
             # 4. Glove word embedding
             if config.word_embedding_dim == 300:
-                glove = GloVe(name='840B', dim=300, cache='../glove', max_vectors=10000000000)
+                glove = GloVe(name='840B', dim=300, cache='/home/user/jaesung/newsreclib/data/glove', max_vectors=10000000000)
             else:
-                glove = GloVe(name='6B', dim=config.word_embedding_dim, cache='../glove', max_vectors=10000000000)
+                glove = GloVe(name='6B', dim=config.word_embedding_dim, cache='/home/user/jaesung/newsreclib/data/glove', max_vectors=10000000000)
             glove_stoi = glove.stoi
             glove_vectors = glove.vectors
             glove_mean_vector = torch.mean(glove_vectors, dim=0, keepdim=False)
@@ -167,13 +167,13 @@ class MIND_Corpus:
             for prefix_index, prefix in enumerate([config.train_root, config.dev_root, config.test_root]):
                 mode = prefix_mode[prefix_index]
                 user_history_num = 0
-                with open(os.path.join(prefix, 'behaviors.tsv'), 'r', encoding='utf-8') as behaviors_f:
+                with open(os.path.join(prefix, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as behaviors_f:
                     for line in behaviors_f:
                         user_history_num += 1
                 user_history_graph = np.zeros([user_history_num, graph_size, graph_size], dtype=np.float32)
                 user_history_category_mask = np.zeros([user_history_num, category_num + 1], dtype=bool)
                 user_history_category_indices = np.zeros([user_history_num, config.max_history_num], dtype=np.int64)
-                with open(os.path.join(prefix, 'behaviors.tsv'), 'r', encoding='utf-8') as behaviors_f:
+                with open(os.path.join(prefix, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as behaviors_f:
                     for line_index, line in enumerate(behaviors_f):
                         impression_ID, user_ID, time, history, impressions = line.split('\t')
                         if config.no_self_connection:
@@ -273,23 +273,27 @@ class MIND_Corpus:
         self.test_indices = []                                                                          # index for test
         self.title_word_num = 0
         self.abstract_word_num = 0
+        
+        # PLM-NR
+        self.news_title_texts = [''] * self.news_num        # 추가: 원본 title 저장용 (PLM)
+        self.news_abstract_texts = [''] * self.news_num     # 추가: 원본 abstract 저장용 (PLM
 
         # generate news meta data
         news_ID_set = set(['<PAD>'])
         news_lines = []
-        with open(os.path.join(config.train_root, 'news.tsv'), 'r', encoding='utf-8') as train_news_f:
+        with open(os.path.join(config.train_root, 'news_raw.tsv'), 'r', encoding='utf-8') as train_news_f:
             for line in train_news_f:
                 news_ID, category, subCategory, title, abstract, _, title_entities, abstract_entities = line.split('\t')
                 if news_ID not in news_ID_set:
                     news_lines.append(line)
                     news_ID_set.add(news_ID)
-        with open(os.path.join(config.dev_root, 'news.tsv'), 'r', encoding='utf-8') as dev_news_f:
+        with open(os.path.join(config.dev_root, 'news_raw.tsv'), 'r', encoding='utf-8') as dev_news_f:
             for line in dev_news_f:
                 news_ID, category, subCategory, title, abstract, _, title_entities, abstract_entities = line.split('\t')
                 if news_ID not in news_ID_set:
                     news_lines.append(line)
                     news_ID_set.add(news_ID)
-        with open(os.path.join(config.test_root, 'news.tsv'), 'r', encoding='utf-8') as test_news_f:
+        with open(os.path.join(config.test_root, 'news_raw.tsv'), 'r', encoding='utf-8') as test_news_f:
             for line in test_news_f:
                 news_ID, category, subCategory, title, abstract, _, title_entities, abstract_entities = line.split('\t')
                 if news_ID not in news_ID_set:
@@ -301,6 +305,11 @@ class MIND_Corpus:
             index = self.news_ID_dict[news_ID]
             self.news_category[index] = self.category_dict[category] if category in self.category_dict else 0
             self.news_subCategory[index] = self.subCategory_dict[subCategory] if subCategory in self.subCategory_dict else 0
+
+            # PLM-NR
+            self.news_title_texts[index] = title  # 추가: 원본 title 저장
+            self.news_abstract_texts[index] = abstract  # 추가: 원본 abstract 저장
+
             words = pat.findall(title.lower()) if config.tokenizer == 'MIND' else word_tokenize(title.lower())
             offsets = [-1 for _ in range(len(title))]
             offset_index = 0
@@ -353,7 +362,7 @@ class MIND_Corpus:
         self.news_abstract_mask[0][0] = 1 # for <PAD> news
 
         # generate behavior meta data
-        with open(os.path.join(config.train_root, 'behaviors.tsv'), 'r', encoding='utf-8') as train_behaviors_f:
+        with open(os.path.join(config.train_root, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as train_behaviors_f:
             for behavior_index, line in enumerate(train_behaviors_f):
                 impression_ID, user_ID, time, history, impressions = line.split('\t')
                 click_impressions = []
@@ -374,7 +383,7 @@ class MIND_Corpus:
                 else:
                     for click_impression in click_impressions:
                         self.train_behaviors.append([self.user_ID_dict[user_ID], [0 for _ in range(self.max_history_num)], np.zeros([self.max_history_num], dtype=bool), click_impression, non_click_impressions, behavior_index])
-        with open(os.path.join(config.dev_root, 'behaviors.tsv'), 'r', encoding='utf-8') as dev_behaviors_f:
+        with open(os.path.join(config.dev_root, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as dev_behaviors_f:
             for dev_ID, line in enumerate(dev_behaviors_f):
                 impression_ID, user_ID, time, history, impressions = line.split('\t')
                 if len(history) != 0:
@@ -390,7 +399,7 @@ class MIND_Corpus:
                     for impression in impressions.strip().split(' '):
                         self.dev_indices.append(dev_ID)
                         self.dev_behaviors.append([self.user_ID_dict[user_ID] if user_ID in self.user_ID_dict else 0, [0 for _ in range(self.max_history_num)], np.zeros([self.max_history_num], dtype=bool), self.news_ID_dict[impression[:-2]], dev_ID])
-        with open(os.path.join(config.test_root, 'behaviors.tsv'), 'r', encoding='utf-8') as test_behaviors_f:
+        with open(os.path.join(config.test_root, 'behaviors_raw.tsv'), 'r', encoding='utf-8') as test_behaviors_f:
             for test_ID, line in enumerate(test_behaviors_f):
                 impression_ID, user_ID, time, history, impressions = line.split('\t')
                 if len(history) != 0:
@@ -412,3 +421,63 @@ class MIND_Corpus:
                             self.test_behaviors.append([self.user_ID_dict[user_ID] if user_ID in self.user_ID_dict else 0, [0 for _ in range(self.max_history_num)], np.zeros([self.max_history_num], dtype=bool), self.news_ID_dict[impression[:-2]], test_ID])
                         else:
                             self.test_behaviors.append([self.user_ID_dict[user_ID] if user_ID in self.user_ID_dict else 0, [0 for _ in range(self.max_history_num)], np.zeros([self.max_history_num], dtype=bool), self.news_ID_dict[impression], test_ID])
+
+        if config.use_plm_news_encoder:
+            self._preprocess_for_plm(config)
+
+    def _preprocess_for_plm(self, config: Config):
+        """PLM용 토큰화 및 저장"""
+        from transformers import BertTokenizer, RobertaTokenizer, AutoTokenizer
+        import pickle
+        from tqdm import tqdm
+
+        print('Preprocessing news texts for PLM...')
+
+        # 1. PLM 토크나이저 로딩
+        if config.plm_type == 'bert':
+            tokenizer = BertTokenizer.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
+        elif config.plm_type == 'roberta':
+            tokenizer = RobertaTokenizer.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
+
+        # 2. 캐시 파일 경로
+        plm_title_file = f'plm_title_{config.plm_type}_{config.dataset}.pkl'
+
+        if not os.path.exists(plm_title_file):
+            news_plm_title_ids = []
+            news_plm_title_masks = []
+
+            for news_index in tqdm(range(self.news_num)):
+                title_text = self.news_title_texts[news_index]
+
+                # PLM 토크나이징
+                encoding = tokenizer(
+                    title_text,
+                    max_length=config.max_title_length,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='np'
+                )
+
+                news_plm_title_ids.append(encoding['input_ids'][0])
+                news_plm_title_masks.append(encoding['attention_mask'][0])
+
+            # NumPy 배열로 변환
+            self.news_plm_title_ids = np.array(news_plm_title_ids, dtype=np.int32)
+            self.news_plm_title_masks = np.array(news_plm_title_masks, dtype=np.int32)
+
+            # 저장
+            with open(plm_title_file, 'wb') as f:
+                pickle.dump({
+                    'title_ids': self.news_plm_title_ids,
+                    'title_masks': self.news_plm_title_masks
+                }, f)
+        else:
+            # 로딩
+            with open(plm_title_file, 'rb') as f:
+                data = pickle.load(f)
+                self.news_plm_title_ids = data['title_ids']
+                self.news_plm_title_masks = data['title_masks']
+
+        print(f'PLM tokenization completed. Shape: {self.news_plm_title_ids.shape}')

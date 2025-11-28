@@ -21,7 +21,7 @@ def train(config: Config, mind_corpus: MIND_Corpus):
         del trainer
     else:
         try:
-            mp.spawn(distributed_train, args=(model, config, mind_corpus, run_index), nprocs=config.world_size, join=True)
+            mp.spawn(distributed_train, args=(model, config, mind_corpus, run_index), nprocs=config.world_size, join=True) # 분산 학습 프로세스 생성
         except Exception as e:
             print(e)
             e = str(e).lower()
