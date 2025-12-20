@@ -35,7 +35,7 @@ class UserEncoder(nn.Module):
     # Output
     # user_representation           : [batch_size, news_embedding_dim]
     def forward(self, user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_category, user_subCategory, \
-                user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, candidate_news_representation):
+                user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, candidate_news_representation, candidate_category=None):
         raise Exception('Function forward must be implemented at sub-class')
 
 
@@ -79,21 +79,21 @@ class SUE(UserEncoder):
         # 1. GCN
         history_embedding = torch.cat([history_embedding, self.dropout_(self.proxy_node_embedding.unsqueeze(dim=0).expand(batch_size, -1, -1))], dim=1) # [batch_size, max_history_num + category_num, news_embedding_dim]
         gcn_feature = self.gcn(history_embedding, user_history_graph) + history_embedding                                                               # [batch_size, max_history_num + category_num, news_embedding_dim]
-        gcn_feature = gcn_feature[:, :self.max_history_num, :]                                                                                          # [batch_size, max_history_num, news_embedding_dim]
-        gcn_feature = gcn_feature.unsqueeze(dim=1).expand(-1, news_num, -1, -1)                                                                         # [batch_size, news_num, max_history_num, news_embedding_dim]
+        gcn_feature = gcn_feature[:, :self.max_history_num, :] # [64, 67, 900] → [64, 50, 900] 프록시 노드 제거, 뉴스 노드만 추출                                                                                 # [batch_size, max_history_num, news_embedding_dim]
+        gcn_feature = gcn_feature.unsqueeze(dim=1).expand(-1, news_num, -1, -1) # [64, 50, 900] → [64, 1, 50, 900] → [64, 5, 50, 900] 각 후보 뉴스마다 동일한 GCN 특징 이용                                                                         # [batch_size, news_num, max_history_num, news_embedding_dim]
         # 2. Intra-cluster attention
         K = self.intraCluster_K(gcn_feature).view([batch_news_num, self.max_history_num, self.attention_dim])                                           # [batch_size * news_num, max_history_num, attention_dim]
         Q = self.intraCluster_Q(candidate_news_representation).view([batch_news_num, self.attention_dim, 1])                                            # [batch_size * news_num, attention_dim, 1]
         a = torch.bmm(K, Q).view([batch_size, news_num, self.max_history_num]) / self.attention_scalar                                                  # [batch_size, news_num, max_history_num]
-        alpha_intra = scatter_softmax(a, user_history_category_indices, 2).unsqueeze(dim=3)                                                             # [batch_size, news_num, max_history_num, 1]
+        alpha_intra = scatter_softmax(a, user_history_category_indices, 2).unsqueeze(dim=3) # a의 shape: [batch_size, news_num, max_history_num], 유저 히스토리 뉴스 중에서 같은 카테고리만 softmax 적용                                                             # [batch_size, news_num, max_history_num, 1]
         intra_cluster_feature = scatter_sum(alpha_intra * gcn_feature, user_history_category_indices, dim=2, dim_size=self.category_num)                # [batch_size, news_num, category_num, news_embedding_dim]
         # perform nonlinear transformation on intra-cluster features
         intra_cluster_feature = self.dropout(F.relu(self.clusterFeatureAffine(intra_cluster_feature), inplace=True) + intra_cluster_feature)            # [batch_size, news_num, category_num, news_embedding_dim]
         # 3. Inter-cluster attention
         inter_cluster_feature = self.interClusterAttention(
-            intra_cluster_feature.view([batch_news_num, self.category_num, self.news_embedding_dim]),
-            candidate_news_representation.view([batch_news_num, self.news_embedding_dim]),
-            mask=user_history_category_mask.view([batch_news_num, self.category_num])
+            intra_cluster_feature.view([batch_news_num, self.category_num, self.news_embedding_dim]), # 카테고리별로 집계된 히스토리 특징들, K,V로 사용
+            candidate_news_representation.view([batch_news_num, self.news_embedding_dim]), # 후보뉴스 Query
+            mask=user_history_category_mask.view([batch_news_num, self.category_num]) # 존재하는 카테고리인지 표기
         ).view([batch_size, news_num, self.news_embedding_dim])                                                                                         # [batch_size, news_num, news_embedding_dim]
         return inter_cluster_feature
 
@@ -372,4 +372,260 @@ class OMAP(UserEncoder):
         if self.training:
             Omega = torch.norm(torch.mm(self.W.transpose(1, 0), self.W) * (self.J_k - self.I_k), p='fro')
             self.auxiliary_loss = self.HiFi_Ark_regularizer_coefficient * Omega
+        return user_representation
+
+
+class MINER(UserEncoder):
+    """
+    핵심 구성요소:
+    1. Poly Attention: K개의 context codes로 K개의 interest vectors 추출
+    2. Disagreement Regularization: Interest vectors 다양성 유도
+    3. Category-Aware Attention: 카테고리 정보 활용 (선택적)
+    4. Score Aggregation: max/mean/weighted 집계
+    """
+
+    def __init__(self, news_encoder: NewsEncoder, config: Config):
+        super(MINER, self).__init__(news_encoder, config)
+
+        # Poly attention parameters
+        self.K = config.num_interest_vectors  # Number of interest vectors (default: 32)
+        self.context_dim = config.context_code_dim  # Context code dimension (default: 200)
+        self.aggregation = config.miner_aggregation  # 'max', 'mean', 'weighted'
+        self.disagreement_beta = config.disagreement_beta  # Default: 0.8
+
+        # K개의 learnable context codes
+        # Shape: [K, context_dim]
+        self.context_codes = nn.Parameter(torch.zeros(self.K, self.context_dim))
+
+        # Projection layer for additive attention
+        # h_j → context_dim으로 projection
+        self.W_h = nn.Linear(
+            self.news_embedding_dim,
+            self.context_dim,
+            bias=False
+        )
+
+        # Weighted aggregation을 위한 target-aware attention
+        if self.aggregation == 'weighted':
+            self.W_e = nn.Linear(
+                self.news_embedding_dim,
+                self.news_embedding_dim,
+                bias=True
+            )
+
+        self.dropout = nn.Dropout(p=config.dropout_rate, inplace=False)
+        self.attention_scalar = math.sqrt(float(self.context_dim))
+        
+        # Category-aware attention parameter
+        # self.category_aware_lambda = config.category_aware_lambda  # 추가! 훈련가능하게해야함
+        # self.category_aware_lambda = nn.Parameter(torch.tensor(config.category_aware_lambda)) # 훈련가능
+        # 논문에서는 λ가 하이퍼파라미터로 보이지만, 학습 가능하게 설정
+        self.category_aware_lambda = nn.Parameter(torch.tensor(config.category_aware_lambda, dtype=torch.float32))
+        self.category_embedding = news_encoder.category_embedding  # 참조 저장
+
+    def initialize(self):
+        """파라미터 초기화"""
+        # Context codes: orthogonal initialization
+        nn.init.orthogonal_(self.context_codes.data)
+
+        # Projection layer: Xavier uniform
+        nn.init.xavier_uniform_(self.W_h.weight)
+
+        # Weighted aggregation layer
+        if self.aggregation == 'weighted':
+            nn.init.xavier_uniform_(self.W_e.weight)
+            nn.init.zeros_(self.W_e.bias)
+
+    def poly_attention(self, history_embeddings, history_mask, user_category=None, candidate_category=None):
+        """
+        Poly Attention with Category-aware Weighting (MINER Equation 5)
+
+        Args:
+            history_embeddings: [batch_size, max_history_num, news_embedding_dim]
+            history_mask: [batch_size, max_history_num]
+            user_category: [batch_size, max_history_num] - history news categories
+            candidate_category: [batch_size, news_num] - candidate news categories
+
+        Returns:
+            interest_vectors: [batch_size, news_num, K, news_embedding_dim] if category-aware
+                           or [batch_size, K, news_embedding_dim] if not
+        """
+        batch_size = history_embeddings.size(0)
+        max_history_num = history_embeddings.size(1)
+
+        # Project history embeddings
+        h_proj = torch.tanh(self.W_h(history_embeddings))
+
+        # Compute attention for all K context codes
+        logits = torch.matmul(h_proj, self.context_codes.T) / self.attention_scalar  # [B, M, K]
+
+        # Category-aware attention weighting (Equation 5)
+        if user_category is not None and candidate_category is not None:
+            # Get category embeddings
+            hist_cat_emb = self.category_embedding(user_category)  # [B, M, cat_dim]
+            cand_cat_emb = self.category_embedding(candidate_category)  # [B, N, cat_dim]
+
+            # Normalize for cosine similarity
+            hist_cat_norm = F.normalize(hist_cat_emb, p=2, dim=2)  # [B, M, cat_dim]
+            cand_cat_norm = F.normalize(cand_cat_emb, p=2, dim=2)  # [B, N, cat_dim]
+
+            # Cosine similarity: [B, M, cat_dim] @ [B, cat_dim, N] = [B, M, N]
+            category_sim = torch.bmm(hist_cat_norm, cand_cat_norm.transpose(1, 2))
+
+            # Expand logits: [B, M, K] → [B, M, N, K]
+            news_num = candidate_category.size(1)
+            logits_expanded = logits.unsqueeze(2).expand(-1, -1, news_num, -1)
+
+            # Add category bias: λ * cos(b_j, b_c)
+            category_bias = self.category_aware_lambda * category_sim.unsqueeze(3)  # [B, M, N, 1]
+            logits = logits_expanded + category_bias  # [B, M, N, K]
+
+            # Mask
+            mask_expanded = history_mask.unsqueeze(2).unsqueeze(3).expand(-1, -1, news_num, self.K)
+            logits = logits.masked_fill(mask_expanded == 0, -1e9)
+
+            # Softmax over history dimension
+            attn_weights = F.softmax(logits, dim=1)  # [B, M, N, K]
+
+            # Weighted sum: [B, N, K, M] @ [B, M, D] = [B, N, K, D]
+            interest_vectors = torch.einsum('bmnk,bmd->bnkd', attn_weights, history_embeddings)
+        else:
+            # Original category-agnostic poly attention
+            mask_expanded = history_mask.unsqueeze(2).expand(-1, -1, self.K)
+            logits = logits.masked_fill(mask_expanded == 0, -1e9)
+            attn_weights = F.softmax(logits, dim=1)
+            interest_vectors = torch.bmm(attn_weights.transpose(1, 2), history_embeddings)  # [B, K, D]
+
+        return interest_vectors
+
+    def compute_disagreement_loss(self, interest_vectors):
+        """
+        Disagreement Regularization (Equation 3)
+
+        Interest vectors 간의 평균 코사인 유사도를 최소화하여 다양성 유도
+
+        Args:
+            interest_vectors: [batch_size, K, news_embedding_dim]
+                또는 [batch_size, news_num, K, news_embedding_dim]
+
+        Returns:
+            loss: scalar
+        """
+        # Reshape if needed
+        if interest_vectors.dim() == 4:
+            batch_size, news_num, K, D = interest_vectors.size()
+            interest_vectors = interest_vectors.view(batch_size * news_num, K, D)
+
+        # Normalize interest vectors
+        # [B, K, D]
+        normalized = F.normalize(interest_vectors, p=2, dim=2)
+
+        # Pairwise cosine similarity
+        # [B, K, D] @ [B, D, K] = [B, K, K]
+        similarity_matrix = torch.bmm(
+            normalized,
+            normalized.transpose(1, 2)
+        )
+
+        # Average over all pairs
+        K = interest_vectors.size(1)
+        loss = similarity_matrix.sum(dim=(1, 2)) / (K * K)
+
+        return loss.mean()
+
+    def forward(
+        self,
+        user_title_text,
+        user_title_mask,
+        user_title_entity,
+        user_content_text,
+        user_content_mask,
+        user_content_entity,
+        user_category,
+        user_subCategory,
+        user_history_mask,
+        user_history_graph,
+        user_history_category_mask,
+        user_history_category_indices,
+        user_embedding,
+        candidate_news_representation,
+        candidate_category=None
+    ):
+        """
+        MINER Forward Pass
+
+        Args:
+            user_category: [batch_size, max_history_num]
+            user_history_mask: [batch_size, max_history_num]
+            candidate_news_representation: [batch_size, news_num, news_embedding_dim]
+            candidate_category: [batch_size, news_num] - candidate news categories
+
+        Returns:
+            user_representation: [batch_size, news_num, news_embedding_dim]
+        """
+        batch_size = user_title_text.size(0)
+        news_num = candidate_news_representation.size(1)
+
+        # Encode history news
+        # [batch_size, max_history_num, news_embedding_dim]
+        history_embedding = self.news_encoder(
+            user_title_text,
+            user_title_mask,
+            user_title_entity,
+            user_content_text,
+            user_content_mask,
+            user_content_entity,
+            user_category,
+            user_subCategory,
+            user_embedding
+        )
+
+        # Poly attention: K개의 interest vectors 추출
+        # Category-aware if candidate_category provided
+        interest_vectors = self.poly_attention(
+            history_embedding,
+            user_history_mask,
+            user_category,
+            candidate_category
+        )
+
+        # Expand for each candidate news (if not already expanded by category-aware attention)
+        if candidate_category is not None:
+            # Already [B, N, K, D] from category-aware poly_attention
+            interest_vectors_exp = interest_vectors
+        else:
+            # [B, K, D] → [B, 1, K, D] → [B, N, K, D]
+            interest_vectors_exp = interest_vectors.unsqueeze(1).expand(-1, news_num, -1, -1)
+
+        # Compute disagreement loss (auxiliary loss)
+        if self.training:
+            self.auxiliary_loss = self.disagreement_beta * self.compute_disagreement_loss(interest_vectors_exp)
+
+        # Aggregate interest vectors for each candidate news
+        if self.aggregation == 'weighted':
+            # Target-aware weighted sum
+            # [B, N, D]
+            W_e_h_c = F.gelu(self.W_e(candidate_news_representation))
+
+            # Attention logits
+            # [B, N, 1, D] @ [B, N, D, K] = [B, N, 1, K] → [B, N, K]
+            logits = torch.matmul(
+                W_e_h_c.unsqueeze(2),  # [B, N, 1, D]
+                interest_vectors_exp.transpose(2, 3)  # [B, N, D, K]
+            ).squeeze(2)  # [B, N, K]
+
+            # Attention weights
+            alpha = F.softmax(logits, dim=2)  # [B, N, K]
+
+            # Weighted sum of interest vectors
+            user_representation = (alpha.unsqueeze(3) * interest_vectors_exp).sum(dim=2)  # [B, N, D]
+
+        elif self.aggregation == 'mean':
+            # Average pooling
+            user_representation = interest_vectors_exp.mean(dim=2)  # [B, N, D]
+
+        elif self.aggregation == 'max':
+            # Max pooling
+            user_representation = interest_vectors_exp.max(dim=2)[0]  # [B, N, D]
+
         return user_representation

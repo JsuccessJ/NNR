@@ -26,7 +26,7 @@ class NewsEncoder(nn.Module):
         nn.init.uniform_(self.category_embedding.weight, -0.1, 0.1)
         nn.init.uniform_(self.subCategory_embedding.weight, -0.1, 0.1)
         nn.init.zeros_(self.subCategory_embedding.weight[0])
-
+    
     # Input
     # title_text          : [batch_size, news_num, max_title_length]
     # title_mask          : [batch_size, news_num, max_title_length]
@@ -39,6 +39,83 @@ class NewsEncoder(nn.Module):
     # user_embedding      : [batch_size, user_embedding_dim]
     # Output
     # news_representation : [batch_size, news_num, news_embedding_dim]
+
+    def load_category_embeddings_from_glove(self, category_dict, frozen=True):
+        """
+        Glove로 category embedding 초기화
+        Args:
+            category_dict: {category_name: index} 딕셔너리
+            frozen: True면 학습 불가 (논문 방식), False면 trainable
+        """
+        from torchtext.vocab import GloVe
+        import re
+
+        # Glove 로드 (840B, 300차원)
+        print("Loading Glove 840B 300d for category embeddings...")
+        glove = GloVe(
+            name='840B',
+            dim=300,
+            cache='/home/user/jaesung/newsreclib/data/glove'
+        )
+
+        category_emb_dim = self.category_embedding.weight.size(1)  # weight.size(): [category_num, category_embedding_dim]
+        print(f"Category embedding dimension: {category_emb_dim}")
+
+        # Category name 전처리 함수
+        def preprocess_category(name):
+            """복합어를 분리하여 단어 리스트 반환
+            Examples:
+                'foodanddrink' → ['food', 'drink']
+                'middleeast' → ['middle', 'east']
+                'northamerica' → ['north', 'america']
+            """
+            # 'and'를 공백으로 치환
+            name = name.replace('and', ' ')
+            # 중복 공백 제거 및 소문자 변환
+            words = name.lower().split()
+            return words
+
+        # Category별 초기화
+        success_count = 0
+        for category_name, idx in category_dict.items():
+            words = preprocess_category(category_name)
+
+            # Glove 벡터 수집
+            vectors = []
+            for word in words:
+                if word in glove.stoi:
+                    vectors.append(glove.vectors[glove.stoi[word]])
+
+            if len(vectors) > 0:
+                # 평균 벡터 계산
+                avg_vector = torch.stack(vectors).mean(dim=0)  # [300]
+
+                # Dimension 조정
+                if category_emb_dim == 300:
+                    category_vector = avg_vector
+                elif category_emb_dim < 300:
+                    # Truncate
+                    category_vector = avg_vector[:category_emb_dim]
+                else:
+                    # Zero padding
+                    padding = torch.zeros(category_emb_dim - 300)
+                    category_vector = torch.cat([avg_vector, padding])
+
+                # Embedding에 할당
+                self.category_embedding.weight.data[idx] = category_vector
+                success_count += 1
+                print(f"  ✓ '{category_name}' initialized from Glove")
+            else:
+                # Glove에 없는 경우 random 유지
+                print(f"  ✗ '{category_name}' uses random initialization")
+
+        # Frozen 여부 설정
+        self.category_embedding.weight.requires_grad = not frozen  # False일때 glove 벡터 그대로 유지
+
+        status = "frozen" if frozen else "trainable"
+        print(f"\nCategory embedding: {success_count}/{len(category_dict)} from Glove ({status})")
+
+
     def forward(self, title_text, title_mask, title_entity, content_text, content_mask, content_entity, category, subCategory, user_embedding):
         raise Exception('Function forward must be implemented at sub-class')
 
@@ -126,8 +203,8 @@ class CNE(NewsEncoder):
         sorted_content_m = torch.cat([sorted_content_c_n[0], sorted_content_c_n[1]], dim=1)                                                                # [batch_size * news_num, hidden_dim * 2]
         sorted_title_h, _ = pad_packed_sequence(sorted_title_h, batch_first=True, total_length=self.max_title_length)                                      # [batch_size * news_num, max_title_length, hidden_dim * 2]
         sorted_content_h, _ = pad_packed_sequence(sorted_content_h, batch_first=True, total_length=self.max_content_length)                                # [batch_size * news_num, max_content_length, hidden_dim * 2]
-        sorted_title_gate = torch.sigmoid(self.title_H(sorted_title_h) + self.title_M(sorted_content_m).unsqueeze(dim=1))                                  # [batch_size * news_num, max_title_length, hidden_dim * 2]
-        sorted_content_gate = torch.sigmoid(self.content_H(sorted_content_h) + self.content_M(sorted_title_m).unsqueeze(dim=1))                            # [batch_size * news_num, max_content_length, hidden_dim * 2]
+        sorted_title_gate = torch.sigmoid(self.title_H(sorted_title_h) + self.title_M(sorted_content_m).unsqueeze(dim=1))        # gate                          # [batch_size * news_num, max_title_length, hidden_dim * 2]
+        sorted_content_gate = torch.sigmoid(self.content_H(sorted_content_h) + self.content_M(sorted_title_m).unsqueeze(dim=1))  # gate                          # [batch_size * news_num, max_content_length, hidden_dim * 2]
         title_h = (sorted_title_h * sorted_title_gate).index_select(0, desorted_title_indices)                                                             # [batch_size * news_num, max_title_length, hidden_dim * 2]
         content_h = (sorted_content_h * sorted_content_gate).index_select(0, desorted_content_indices)                                                     # [batch_size * news_num, max_content_length, hidden_dim * 2]
         # 3. self-attention
@@ -436,7 +513,7 @@ class Inception(NewsEncoder):
 
 class PLMNewsEncoder(NewsEncoder):
     def __init__(self, config: Config):
-        super(PLMNewsEncoder, self).__init__()
+        super(PLMNewsEncoder, self).__init__(config)
         self.config = config
 
         # 1. PLM 로딩
@@ -457,7 +534,7 @@ class PLMNewsEncoder(NewsEncoder):
         # 3. Pooling -> attention
         self.pooling_method = config.plm_pooling
         if self.pooling_method == 'attention':
-            self.attention = Attention(hidden_dim=self.plm_hidden_dim, attention_dim=config.attention_dim)
+            self.attention = Attention(feature_dim=self.plm_hidden_dim, attention_dim=config.attention_dim)
         
         # 4. Dropout 설정
         self.dropout =  nn.Dropout(p=config.dropout_rate, inplace=False)
@@ -586,16 +663,8 @@ class PLMNAML(PLMNewsEncoder):
         news_repr = self.dropout(news_repr)
         news_repr = news_repr.view([batch_size, news_num, self.plm_hidden_dim])
 
-        # 4. Category fusion
-        category_repr = self.dropout(self.category_embedding(category))  # [B, N, cat_dim]
-        subCategory_repr = self.dropout(self.subCategory_embedding(subCategory))  # [B, N, subcat_dim]
-
-        # 5. Concatenation
-        news_representation = torch.cat([
-            news_repr,
-            category_repr,
-            subCategory_repr
-        ], dim=2)  # [B, N, 768+50+50=868]
+        # 4. Feature fusion (category/subcategory concatenation)
+        news_representation = self.feature_fusion(news_repr, category, subCategory)  # [B, N, 768+50+50=868]
 
         return news_representation
 
@@ -634,3 +703,82 @@ class PLMNRMS(PLMNewsEncoder):
         news_representation = news_repr.view([batch_size, news_num, self.plm_hidden_dim])
 
         return news_representation
+
+
+class PLMMiner(PLMNewsEncoder):
+    """
+    PLM-empowered encoder for MINER user encoder
+    - PLM for title encoding
+    - Category/SubCategory fusion
+    - Automatic GloVe initialization for category embeddings (for category-aware attention)
+    """
+
+    def __init__(self, config: Config, category_dict: dict):
+        super(PLMMiner, self).__init__(config)
+
+        # Category embeddings
+        self.category_embedding = nn.Embedding(
+            num_embeddings=config.category_num,
+            embedding_dim=config.category_embedding_dim
+        )
+
+        # News embedding dimension
+        self.news_embedding_dim = self.plm_hidden_dim
+
+        # Store category_dict for GloVe initialization
+        self.category_dict = category_dict
+        self.use_category_glove = config.use_category_glove
+
+    def initialize(self):
+        super().initialize()
+
+        # Default: random uniform initialization
+        nn.init.uniform_(self.category_embedding.weight, -0.1, 0.1)
+
+        # GloVe initialization for category embeddings (if enabled)
+        if self.use_category_glove:
+            print("\n" + "="*60)
+            print("PLMMiner: Initializing category embeddings with GloVe 840B 300d")
+            print("="*60)
+            self.load_category_embeddings_from_glove(
+                category_dict=self.category_dict,
+                frozen=True  # 카테고리 임베딩은 훈련하면 안됨
+            )
+            print("="*60 + "\n")
+
+    def forward(self, title_text, title_mask, title_entity, content_text, content_mask, content_entity, category, subCategory, user_embedding):
+        """
+        Args:
+            title_text: [batch_size, news_num, max_title_length] - PLM token IDs
+            title_mask: [batch_size, news_num, max_title_length] - PLM attention mask
+            category: [batch_size, news_num]
+            subCategory: [batch_size, news_num]
+
+        Returns:
+            news_representation: [batch_size, news_num, news_embedding_dim]
+        """
+        batch_size = title_text.size(0)
+        news_num = title_text.size(1)
+        max_title_length = title_text.size(2)
+        batch_news_num = batch_size * news_num
+
+        # 1. Reshape for PLM
+        title_text = title_text.view([batch_news_num, max_title_length])
+        title_mask = title_mask.view([batch_news_num, max_title_length])
+
+        # 2. PLM encoding
+        plm_output = self.plm(
+            input_ids=title_text,
+            attention_mask=title_mask,
+            return_dict=True
+        )
+        hidden_states = plm_output.last_hidden_state  # [B*N, seq_len, 768]
+
+        # 3. Pooling
+        news_repr = self._pool_hidden_states(hidden_states, title_mask)  # [B*N, 768]
+        news_repr = self.dropout(news_repr)
+        news_repr = news_repr.view([batch_size, news_num, self.plm_hidden_dim])
+
+        return news_repr
+
+

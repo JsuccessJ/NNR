@@ -479,5 +479,10 @@ class MIND_Corpus:
                 data = pickle.load(f)
                 self.news_plm_title_ids = data['title_ids']
                 self.news_plm_title_masks = data['title_masks']
+        
+        print(f'PLM preprocessing completed. Replacing news_title_text with PLM tokenized data.')
+        # PLM 데이터를 기본 데이터로 교체 (기존 데이터셋 클래스와 호환성 유지)
+        self.news_title_text = self.news_plm_title_ids
+        self.news_title_mask = self.news_plm_title_masks
 
         print(f'PLM tokenization completed. Shape: {self.news_plm_title_ids.shape}')

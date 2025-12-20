@@ -14,20 +14,33 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import get_linear_schedule_with_warmup
 
 
 class Trainer:
     def __init__(self, model: nn.Module, config: Config, mind_corpus: MIND_Corpus, run_index: int):
-        self.model = model # model.py:120-133에 forward() 메서드가 있음
+        self.model = model # model.py에 forward() 메서드가 있음
         self.epoch = config.epoch
         self.batch_size = config.batch_size
         self.max_history_num = config.max_history_num
         self.negative_sample_num = config.negative_sample_num
         self.loss = self.negative_log_softmax if config.click_predictor in ['dot_product', 'mlp', 'FIM'] else self.negative_log_sigmoid
         self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=config.lr, weight_decay=config.weight_decay)
+        
         self._dataset = config.dataset
         self.mind_corpus = mind_corpus
         self.train_dataset = MIND_Train_Dataset(mind_corpus)
+
+        # 전체 training step 계산
+        total_steps = len(self.train_dataset) // config.batch_size * config.epoch
+        warmup_steps = int(total_steps * 0.1)  # 10% warmup
+
+        # LR Scheduler 추가 (논문: 10% warmup + linear decay)
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
         self.run_index = run_index
         self.model_dir = config.model_dir + '/#' + str(self.run_index)
         self.best_model_dir = config.best_model_dir + '/#' + str(self.run_index)
@@ -73,13 +86,17 @@ class Trainer:
 
     def train(self):
         model = self.model
-        for e in tqdm(range(1, self.epoch + 1)):
+        for e in tqdm(range(1, self.epoch + 1), desc='Epoch'):
             self.train_dataset.negative_sampling()
             train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.batch_size // 16, pin_memory=True)
             model.train()
             epoch_loss = 0
+            
+            # 배치 단위 진행률 표시
+            train_dataloader_with_progress = tqdm(train_dataloader, desc=f'Epoch {e}/{self.epoch}', leave=False)
+            
             for (user_ID, user_category, user_subCategory, user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, \
-                news_category, news_subCategory, news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity) in train_dataloader:
+                news_category, news_subCategory, news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity) in train_dataloader_with_progress:
                 user_ID = user_ID.cuda(non_blocking=True)                                                                                                                       # [batch_size]
                 user_category = user_category.cuda(non_blocking=True)                                                                                                           # [batch_size, max_history_num]
                 user_subCategory = user_subCategory.cuda(non_blocking=True)                                                                                                     # [batch_size, max_history_num]
@@ -113,11 +130,16 @@ class Trainer:
                     user_encoder_auxiliary_loss = model.user_encoder.auxiliary_loss.mean()
                     loss += user_encoder_auxiliary_loss
                 epoch_loss += float(loss) * user_ID.size(0)
+                
+                # 실시간 loss 표시
+                train_dataloader_with_progress.set_postfix({'loss': f'{float(loss):.4f}', 'avg_loss': f'{epoch_loss / ((train_dataloader_with_progress.n + 1) * self.batch_size):.4f}'})
+                
                 self.optimizer.zero_grad()
                 loss.backward()
                 if self.gradient_clip_norm > 0:
                     nn.utils.clip_grad_norm_(model.parameters(), self.gradient_clip_norm)
                 self.optimizer.step()
+                self.scheduler.step()  # LR scheduler step (10% warmup + linear decay)
             print('Epoch %d : train done' % e)
             print('loss =', epoch_loss / len(self.train_dataset))
 
@@ -218,8 +240,19 @@ def distributed_train(rank, model: nn.Module, config: Config, mind_corpus: MIND_
     batch_size = config.batch_size // world_size
     model = DDP(model, device_ids=[rank])
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.module.parameters()), lr=config.lr, weight_decay=config.weight_decay)
-    gradient_clip_norm = config.gradient_clip_norm
+    
+    # LR Scheduler (10% warmup + linear decay)
+    from transformers import get_linear_schedule_with_warmup
     train_dataset = MIND_Train_Dataset(mind_corpus)
+    total_steps = len(train_dataset) // batch_size * epoch
+    warmup_steps = int(total_steps * 0.1)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
+    
+    gradient_clip_norm = config.gradient_clip_norm
     if rank == 0:
         model_dir = config.model_dir + '/#' + str(run_index)
         best_model_dir = config.best_model_dir + '/#' + str(run_index)
@@ -251,15 +284,22 @@ def distributed_train(rank, model: nn.Module, config: Config, mind_corpus: MIND_
         epoch_not_increase = 0
         print('Running : ' + model_name + '\t#' + str(run_index))
 
-    for e in tqdm(range(1, epoch + 1)):
+    for e in tqdm(range(1, epoch + 1), desc='Epoch', disable=(rank != 0)):
         train_dataset.negative_sampling(rank=rank)
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
         train_sampler.set_epoch(e)
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=batch_size // 16, pin_memory=True, sampler=train_sampler)
         model.train()
         epoch_loss = 0
+        
+        # 배치 단위 진행률 표시 (rank 0만)
+        if rank == 0:
+            train_dataloader_with_progress = tqdm(train_dataloader, desc=f'Epoch {e}/{epoch}', leave=False)
+        else:
+            train_dataloader_with_progress = train_dataloader
+        
         for (user_ID, user_category, user_subCategory, user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, \
-            news_category, news_subCategory, news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity) in train_dataloader:
+            news_category, news_subCategory, news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity) in train_dataloader_with_progress:
             user_ID = user_ID.cuda(non_blocking=True)                                                                                                                       # [batch_size]
             user_category = user_category.cuda(non_blocking=True)                                                                                                           # [batch_size, max_history_num]
             user_subCategory = user_subCategory.cuda(non_blocking=True)                                                                                                     # [batch_size, max_history_num]
@@ -293,11 +333,17 @@ def distributed_train(rank, model: nn.Module, config: Config, mind_corpus: MIND_
                 user_encoder_auxiliary_loss = model.module.user_encoder.auxiliary_loss.mean()
                 loss += user_encoder_auxiliary_loss
             epoch_loss += float(loss) * user_ID.size(0)
+            
+            # 실시간 loss 표시 (rank 0만)
+            if rank == 0 and hasattr(train_dataloader_with_progress, 'set_postfix'):
+                train_dataloader_with_progress.set_postfix({'loss': f'{float(loss):.4f}', 'avg_loss': f'{epoch_loss / ((train_dataloader_with_progress.n + 1) * batch_size):.4f}'})
+            
             optimizer.zero_grad()
             loss.backward()
             if gradient_clip_norm > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
             optimizer.step()
+            scheduler.step()  # LR scheduler step (10% warmup + linear decay)
         print('rank %d : Epoch %d : train done' % (rank, e))
         print('rank %d : loss = %.6f' % (rank, epoch_loss / len(train_dataset) * world_size))
 

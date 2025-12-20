@@ -13,8 +13,8 @@ class Config:
         parser = argparse.ArgumentParser(description='Neural news recommendation')
         # General config
         parser.add_argument('--mode', type=str, default='train', choices=['train', 'dev', 'test'], help='Mode')
-        parser.add_argument('--news_encoder', type=str, default='CNE', choices=['CNE', 'CNN', 'MHSA', 'KCNN', 'HDC', 'NAML', 'PNE', 'DAE', 'Inception', 'NAML_Title', 'NAML_Content', 'CNE_Title', 'CNE_Content', 'CNE_wo_CS', 'CNE_wo_CA'], help='News encoder')
-        parser.add_argument('--user_encoder', type=str, default='SUE', choices=['SUE', 'LSTUR', 'MHSA', 'ATT', 'CATT', 'FIM', 'PUE', 'GRU', 'OMAP', 'SUE_wo_GCN', 'SUE_wo_HCA'], help='User encoder')
+        parser.add_argument('--news_encoder', type=str, default='CNE', choices=['CNE', 'CNN', 'MHSA', 'KCNN', 'HDC', 'NAML', 'PNE', 'DAE', 'Inception', 'PLMNAML', 'PLMNRMS', 'PLMMiner', 'NAML_Title', 'NAML_Content', 'CNE_Title', 'CNE_Content', 'CNE_wo_CS', 'CNE_wo_CA'], help='News encoder')
+        parser.add_argument('--user_encoder', type=str, default='SUE', choices=['SUE', 'LSTUR', 'MHSA', 'ATT', 'CATT', 'FIM', 'PUE', 'GRU', 'OMAP', 'MINER', 'SUE_wo_GCN', 'SUE_wo_HCA'], help='User encoder')
         parser.add_argument('--dev_model_path', type=str, default='', help='Dev model path')
         parser.add_argument('--test_model_path', type=str, default='', help='Test model path')
         parser.add_argument('--test_output_file', type=str, default='', help='Specific test output file')
@@ -81,12 +81,25 @@ class Config:
         parser.add_argument('--plm_lr', type=float, default=1e-5,help='Learning rate for PLM fine-tuning')
         parser.add_argument('--plm_pooling', type=str, default='attention',choices=['cls', 'average', 'attention'],help='Pooling method for PLM hidden states')
         parser.add_argument('--use_plm_news_encoder', action='store_true', help='Use PLM-based news encoder')
-
-
+        # MINER-specific parameters
+        parser.add_argument('--num_interest_vectors', type=int, default=32, help='Number of interest vectors K in MINER (default: 32)')
+        parser.add_argument('--context_code_dim', type=int, default=200, help='Dimension of context codes in MINER (default: 200)')
+        parser.add_argument('--disagreement_beta', type=float, default=0.8, help='Weight for disagreement regularization (default: 0.8)')
+        parser.add_argument('--miner_aggregation', type=str, default='weighted', choices=['max', 'mean', 'weighted'], help='Score aggregation method in MINER (default: weighted)')
+        parser.add_argument('--category_embedding_path', type=str, default='', help='Path to pre-trained category embeddings (Glove format)')
+        # MINER Category-aware attention parameter
+        parser.add_argument('--category_aware_lambda', type=float, default=0.5, help='Weight for category similarity in attention (default: 0.5)')
+        parser.add_argument('--use_category_glove', action='store_true',help='Use Glove initialization for category embeddings')
 
         self.attribute_dict = dict(vars(parser.parse_args()))
         for attribute in self.attribute_dict:
             setattr(self, attribute, self.attribute_dict[attribute])
+        
+        # PLM 기반 뉴스 인코더를 사용할 때 자동으로 use_plm_news_encoder 설정
+        if self.news_encoder in ['PLMNAML', 'PLMNRMS', 'PLMMiner']:
+            self.use_plm_news_encoder = True
+            self.attribute_dict['use_plm_news_encoder'] = True
+        
         self.train_root = '../MIND-%s/train' % self.dataset
         self.dev_root = '../MIND-%s/dev' % self.dataset
         self.test_root = '../MIND-%s/test' % self.dataset

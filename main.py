@@ -11,7 +11,7 @@ import torch.multiprocessing as mp
 
 
 def train(config: Config, mind_corpus: MIND_Corpus):
-    model = Model(config)
+    model = Model(config, mind_corpus.category_dict)
     model.initialize()
     run_index = get_run_index(config.result_dir)
     if config.world_size == 1:
@@ -35,7 +35,7 @@ def train(config: Config, mind_corpus: MIND_Corpus):
 
 
 def dev(config: Config, mind_corpus: MIND_Corpus):
-    model = Model(config)
+    model = Model(config, mind_corpus.category_dict)
     assert os.path.exists(config.dev_model_path), 'Dev model does not exist : ' + config.dev_model_path
     model.load_state_dict(torch.load(config.dev_model_path, map_location=torch.device('cpu'))[model.model_name])
     model.cuda()
@@ -49,7 +49,7 @@ def dev(config: Config, mind_corpus: MIND_Corpus):
 
 
 def test(config: Config, mind_corpus: MIND_Corpus):
-    model = Model(config)
+    model = Model(config, mind_corpus.category_dict)
     assert os.path.exists(config.test_model_path), 'Test model does not exist : ' + config.test_model_path
     model.load_state_dict(torch.load(config.test_model_path, map_location=torch.device('cpu'))[model.model_name])
     model.cuda()

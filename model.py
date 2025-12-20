@@ -8,17 +8,18 @@ import variantEncoders
 
 
 class Model(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, category_dict: dict = None):
         super(Model, self).__init__()
-        if config.use_plm_news_encoder:
-            if config.new_encoder == 'NAML':
-                self.news_encoder = newsEncoders.PLMNAML(config)
-            elif config.news_encoder == 'NRMS':
-                self.news_encoder = newsEncoders.PLMNRMS(config)
-            else:
-                raise Exception(f'PLM-{config.news_encoder} is not implemented')
+
+        if config.news_encoder == 'PLMNAML':
+            self.news_encoder = newsEncoders.PLMNAML(config)
+        elif config.news_encoder == 'PLMNRMS':
+            self.news_encoder = newsEncoders.PLMNRMS(config)
+        elif config.news_encoder == 'PLMMiner':
+            assert category_dict is not None, 'PLMMiner requires category_dict'
+            self.news_encoder = newsEncoders.PLMMiner(config, category_dict)
         # For main experiments of news encoding
-        if config.news_encoder == 'CNE':
+        elif config.news_encoder == 'CNE':
             self.news_encoder = newsEncoders.CNE(config)
         elif config.news_encoder == 'CNN':
             self.news_encoder = newsEncoders.CNN(config)
@@ -71,6 +72,8 @@ class Model(nn.Module):
             self.user_encoder = userEncoders.GRU(self.news_encoder, config)
         elif config.user_encoder == 'OMAP':
             self.user_encoder = userEncoders.OMAP(self.news_encoder, config)
+        elif config.user_encoder == 'MINER':
+            self.user_encoder = userEncoders.MINER(self.news_encoder, config)
         # For ablations of user encoding
         elif config.user_encoder == 'SUE_wo_GCN':
             self.user_encoder = variantEncoders.SUE_wo_GCN(self.news_encoder, config)
@@ -129,7 +132,7 @@ class Model(nn.Module):
         user_embedding = self.dropout(self.user_embedding(user_ID)) if self.use_user_embedding else None                                                                                                         # [batch_size, news_embedding_dim]
         news_representation = self.news_encoder(news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity, news_category, news_subCategory, user_embedding) # [batch_size, 1 + negative_sample_num, news_embedding_dim]
         user_representation = self.user_encoder(user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_category, user_subCategory, \
-                                                user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, news_representation)                           # [batch_size, 1 + negative_sample_num, news_embedding_dim]
+                                                user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, news_representation, news_category)                           # [batch_size, 1 + negative_sample_num, news_embedding_dim]
         if self.click_predictor == 'dot_product':
             logits = (user_representation * news_representation).sum(dim=2) # dot-product
         elif self.click_predictor == 'mlp':

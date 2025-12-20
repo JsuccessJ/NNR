@@ -21,6 +21,8 @@
 /__pycache__
 /.vscode
 
+# PLM cache files (HuggingFace Transformers)
+/plm_cache/
 
 *.o
 *.so
