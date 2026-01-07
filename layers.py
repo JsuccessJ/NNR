@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -321,3 +322,41 @@ class GCN(nn.Module):
             out = self.dropout(self.gcn_layers[i](out, graph))
         out = self.gcn_layers[self.num_layers - 1](out, graph)
         return out
+
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model, num_heads, head_dim, dropout=0.2):
+        super(MultiHeadSelfAttention, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.d_model = d_model
+
+        self.W_Q = nn.Linear(d_model, head_dim * num_heads)
+        self.W_K = nn.Linear(d_model, head_dim * num_heads)
+        self.W_V = nn.Linear(d_model, head_dim * num_heads)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, Q, K, V, mask=None):
+        batch_size, seq_len, _ = Q.shape
+
+        # Linear projection
+        q = self.W_Q(Q).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.W_K(K).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.W_V(V).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim)
+        scores = torch.exp(scores)
+
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, seq_len]
+            scores = scores * mask
+
+        attn = scores / (torch.sum(scores, dim=-1, keepdim=True) + 1e-8)
+        context = torch.matmul(attn, v)  # [B, num_heads, seq_len, head_dim]
+
+        # Concatenate heads
+        context = context.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, self.num_heads * self.head_dim)
+
+        return self.dropout(context)

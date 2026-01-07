@@ -22,7 +22,7 @@ class Config:
         parser.add_argument('--seed', type=int, default=0, help='Seed for random number generator')
         parser.add_argument('--config_file', type=str, default='', help='Config file path')
         # Dataset config
-        parser.add_argument('--dataset', type=str, default='small', choices=['200k', 'small', 'large'], help='Dataset type')
+        parser.add_argument('--dataset', type=str, default='small', choices=['200k', 'small', 'large', 'eb-nerd'], help='Dataset type')
         parser.add_argument('--tokenizer', type=str, default='MIND', choices=['MIND', 'NLTK'], help='Sentence tokenizer')
         parser.add_argument('--word_threshold', type=int, default=3, help='Word threshold')
         parser.add_argument('--max_title_length', type=int, default=32, help='Sentence truncate length for title')
@@ -77,7 +77,7 @@ class Config:
         # PLM-NR config
         parser.add_argument('--plm_type', type=str, default='bert',choices=['bert', 'roberta', 'unilm', 'none'], help='Pre-trained Language Model type')
         parser.add_argument('--plm_model_name', type=str, default='bert-base-uncased',help='Specific PLM model name from HuggingFace')
-        parser.add_argument('--plm_frozen_layers', type=int, default=10, help='Number of PLM layers to freeze (0=fine-tune all)')
+        parser.add_argument('--plm_frozen_layers', type=int, default=6, help='Number of PLM layers to freeze (0=fine-tune all)')
         parser.add_argument('--plm_lr', type=float, default=1e-5,help='Learning rate for PLM fine-tuning')
         parser.add_argument('--plm_pooling', type=str, default='attention',choices=['cls', 'average', 'attention'],help='Pooling method for PLM hidden states')
         parser.add_argument('--use_plm_news_encoder', action='store_true', help='Use PLM-based news encoder')
@@ -100,10 +100,18 @@ class Config:
             self.use_plm_news_encoder = True
             self.attribute_dict['use_plm_news_encoder'] = True
         
-        self.train_root = '../MIND-%s/train' % self.dataset
-        self.dev_root = '../MIND-%s/dev' % self.dataset
-        self.test_root = '../MIND-%s/test' % self.dataset
+        if self.dataset == 'eb-nerd':
+            self.train_root = '../EB-NERD-Dataset/train'
+            self.dev_root = '../EB-NERD-Dataset/dev'
+            self.test_root = '../EB-NERD-Dataset/test'
+        else:
+            self.train_root = '../MIND-%s/train' % self.dataset
+            self.dev_root = '../MIND-%s/dev' % self.dataset
+            self.test_root = '../MIND-%s/test' % self.dataset
         if self.dataset == 'small': # suggested configuration for MIND-small
+            self.dropout_rate = 0.25
+            self.gcn_layer_num = 3
+        elif self.dataset == 'eb-nerd': # suggested configuration for EB-NERD (similar to MIND-small)
             self.dropout_rate = 0.25
             self.gcn_layer_num = 3
         elif self.dataset == '200k': # suggested configuration for MIND-200k
@@ -159,7 +167,10 @@ class Config:
             self.test_root + '/news_raw.tsv', self.test_root + '/behaviors_raw.tsv', self.test_root + '/entity_embedding.vec', self.test_root + '/context_embedding.vec'
         ]
         if not all(list(map(os.path.exists, dataset_files))):
-            exec('prepare_MIND_%s()' % self.dataset)
+            if self.dataset != 'eb-nerd':  # EB-NERD는 이미 준비되어 있음
+                exec('prepare_MIND_%s()' % self.dataset)
+            else:
+                raise FileNotFoundError(f'EB-NERD dataset files not found. Please check the path: {self.train_root}')
 
         model_name = self.news_encoder + '-' + self.user_encoder
         mkdirs = lambda x: os.makedirs(x) if not os.path.exists(x) else None

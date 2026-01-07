@@ -5,9 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.rnn import pad_packed_sequence
-from layers import Conv1D, Conv2D_Pool, MultiHeadAttention, Attention, ScaledDotProduct_CandidateAttention, CandidateAttention
+from layers import Conv1D, Conv2D_Pool, MultiHeadAttention, Attention, ScaledDotProduct_CandidateAttention, CandidateAttention, MultiHeadSelfAttention
 # PLM-NR
-from transformers import BertModel , RobertaModel, AutoModel
+from transformers import BertModel, RobertaModel, AutoModel
 
 class NewsEncoder(nn.Module):
     def __init__(self, config: Config):
@@ -511,15 +511,24 @@ class Inception(NewsEncoder):
         return news_representation
 
 
-class PLMNewsEncoder(NewsEncoder):
+class PLMNewsEncoder(nn.Module):
     def __init__(self, config: Config):
-        super(PLMNewsEncoder, self).__init__(config)
+        super(PLMNewsEncoder, self).__init__()
         self.config = config
-
-        # 1. PLM 로딩
         self.plm_hidden_dim = 768 # Bert-Base hidden size
+        
+        # 1. PLM 로딩
         if config.plm_type == 'bert':
-            self.plm = BertModel.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
+            from transformers import AutoConfig
+            plm_config = AutoConfig.from_pretrained(
+                config.plm_model_name,
+                output_hidden_states=True # ⭐️ 모든 레이어 출력
+            )
+            plm_config.num_hidden_layers = 8 # ⭐️ 8개 레이어로 제한
+            self.plm = BertModel.from_pretrained(
+                config.plm_model_name,
+                config=plm_config,
+                cache_dir='plm_cache/',)
             self.plm_hidden_dim = self.plm.config.hidden_size
         elif config.plm_type == 'roberta':
             self.plm = RobertaModel.from_pretrained(config.plm_model_name, cache_dir='plm_cache/')
@@ -531,10 +540,19 @@ class PLMNewsEncoder(NewsEncoder):
         # 2. PLM Layer Freezing (마지막 N개 레이어만 학습)
         self._freeze_plm_layers(config.plm_frozen_layers)
 
+        self.multihead_attention = MultiHeadSelfAttention(
+            d_model=self.plm_hidden_dim, # 768
+            num_heads=config.head_num, # 20
+            head_dim=config.head_dim, # 20
+            dropout=config.dropout_rate
+        )
+        
         # 3. Pooling -> attention
         self.pooling_method = config.plm_pooling
         if self.pooling_method == 'attention':
-            self.attention = Attention(feature_dim=self.plm_hidden_dim, attention_dim=config.attention_dim)
+            self.attention = Attention(
+                feature_dim=config.head_num * config.head_dim,  # 400
+                attention_dim=config.attention_dim)
         
         # 4. Dropout 설정
         self.dropout =  nn.Dropout(p=config.dropout_rate, inplace=False)
@@ -543,19 +561,21 @@ class PLMNewsEncoder(NewsEncoder):
         self.auxiliary_loss = None
     
     def _freeze_plm_layers(self, frozen_layers):
-        """PLM의 하위 레이어 frozen"""
-        if frozen_layers == 0:
-            # 전체 fine-tune
-            return
+        # ⭐ 수정: 8개 레이어 중 layer 6, 7만 학습
+        # frozen_layers = 6으로 설정해야 함
+        total_layers = len(self.plm.encoder.layer)  # 8
 
-        # BERT/RoBERTa 구조: encoder.layer.0 ~ encoder.layer.11 총 12개층으로 구성됨
-        total_layers = len(self.plm.encoder.layer)
+        # Embedding layer freezing
+        for param in self.plm.embeddings.parameters():
+            param.requires_grad = False
 
+        # Layer 0~5 frozen, Layer 6~7 학습
         for layer_idx in range(frozen_layers):
             for param in self.plm.encoder.layer[layer_idx].parameters():
                 param.requires_grad = False
 
         print(f'Frozen {frozen_layers} layers out of {total_layers} in PLM')
+        print(f'Trainable layers: {list(range(frozen_layers, total_layers))}')
 
     def _pool_hidden_states(self, hidden_states, attention_mask):
         """
@@ -568,25 +588,102 @@ class PLMNewsEncoder(NewsEncoder):
         Returns:
             news_embedding: [batch_news_num, hidden_dim]
         """
+
+        # hidden_states는 이미 각 클래스에서 추출되어 전달됨
+        # PLMNAML: plm_output.hidden_states[8]
+        # PLMNRMS, PLMMiner: plm_output.last_hidden_state
+        # [B*N, seq_len, 768]
+
+        # ⭐ 추가: Multi-head self-attention
+        mhsa_output = self.multihead_attention(hidden_states, hidden_states, hidden_states, mask=attention_mask)  # [B*N, seq_len, 400]
+        
+    # [B*N, seq_len, 400]
         if self.pooling_method == 'cls':
             # [CLS] 토큰의 representation 사용, hidden_states: [batch_news_num, seq_len, hidden_dim] -> [B*N, hidden_dim]
-            news_embedding = hidden_states[:, 0, :]  # [B*N, hidden_dim]
+            news_embedding = mhsa_output[:, 0, :]  # ⭐️ mhsa_output 사용
 
         elif self.pooling_method == 'average':
             # Attention mask를 고려한 평균
-            mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-            sum_hidden = torch.sum(hidden_states * mask_expanded, dim=1)  # [B*N, hidden_dim]
+            mask_expanded = attention_mask.unsqueeze(-1).expand(mhsa_output.size()).float()
+            sum_hidden = torch.sum(mhsa_output * mask_expanded, dim=1)
             sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
             news_embedding = sum_hidden / sum_mask
 
+        # Attention pooling
         elif self.pooling_method == 'attention':
-            # Attention 메커니즘
-            news_embedding = self.attention(hidden_states, mask=attention_mask)  # [B*N, hidden_dim]
-
+            news_embedding = self.attention(mhsa_output, mask=attention_mask)
+        # [B*N, 400]
+        
         else:
             raise ValueError(f'Unknown pooling method: {self.pooling_method}')
 
         return news_embedding
+
+    def load_category_embeddings_from_glove(self, category_dict, frozen=True):
+        """
+        Glove로 category embedding 초기화
+        Args:
+            category_dict: {category_name: index} 딕셔너리
+            frozen: True면 학습 불가 (논문 방식), False면 trainable
+        """
+        from torchtext.vocab import GloVe
+        import re
+
+        # Glove 로드 (840B, 300차원)
+        print("Loading Glove 840B 300d for category embeddings...")
+        glove = GloVe(
+            name='840B',
+            dim=300,
+            cache='/home/user/jaesung/newsreclib/data/glove'
+        )
+
+        category_emb_dim = self.category_embedding.weight.size(1)
+        print(f"Category embedding dimension: {category_emb_dim}")
+
+        # Category name 전처리 함수
+        def preprocess_category(name):
+            # 'and'를 공백으로 치환
+            name = name.replace('and', ' ')
+            # 중복 공백 제거 및 소문자 변환
+            words = name.lower().split()
+            return words
+
+        # Category별 초기화
+        success_count = 0
+        for category_name, idx in category_dict.items():
+            words = preprocess_category(category_name)
+
+            # Glove 벡터 수집
+            vectors = []
+            for word in words:
+                if word in glove.stoi:
+                    vectors.append(glove.vectors[glove.stoi[word]])
+
+            if len(vectors) > 0:
+                # 평균 벡터 계산
+                avg_vector = torch.stack(vectors).mean(dim=0)  # [300]
+
+                # Dimension 조정
+                if category_emb_dim == 300:
+                    category_vector = avg_vector
+                elif category_emb_dim < 300:
+                    category_vector = avg_vector[:category_emb_dim]
+                else:
+                    padding = torch.zeros(category_emb_dim - 300)
+                    category_vector = torch.cat([avg_vector, padding])
+
+                # Embedding에 할당
+                self.category_embedding.weight.data[idx] = category_vector
+                success_count += 1
+                print(f"  ✓ '{category_name}' initialized from Glove")
+            else:
+                print(f"  ✗ '{category_name}' uses random initialization")
+
+        # Frozen 여부 설정
+        self.category_embedding.weight.requires_grad = not frozen
+
+        status = "frozen" if frozen else "trainable"
+        print(f"\nCategory embedding: {success_count}/{len(category_dict)} from Glove ({status})")
 
     def initialize(self):
         """파라미터 초기화"""
@@ -607,6 +704,13 @@ class PLMNAML(PLMNewsEncoder):
     def __init__(self, config: Config):
         super(PLMNAML, self).__init__(config)
 
+        # ⭐ 추가: Dimension reduction layer
+        self.news_compression_dim = 64  # 논문과 동일
+        self.reduce_dim = nn.Linear(
+            config.head_num * config.head_dim,  # 400
+            self.news_compression_dim           # 64
+        )
+        
         # Category embeddings
         self.category_embedding = nn.Embedding(
             num_embeddings=config.category_num,
@@ -617,12 +721,12 @@ class PLMNAML(PLMNewsEncoder):
             embedding_dim=config.subCategory_embedding_dim
         )
 
-        # News embedding dimension
+        # ⭐ 수정: News embedding dimension
         self.news_embedding_dim = (
-            self.plm_hidden_dim +
-            config.category_embedding_dim +
-            config.subCategory_embedding_dim
-        )
+            self.news_compression_dim +           # 64
+            config.category_embedding_dim +       # 50
+            config.subCategory_embedding_dim      # 50
+        )  # 총 164
 
     def initialize(self):
         super().initialize()
@@ -654,17 +758,24 @@ class PLMNAML(PLMNewsEncoder):
         plm_output = self.plm(
             input_ids=title_text,
             attention_mask=title_mask,
-            return_dict=True
+            return_dict=True,
+            output_hidden_states=True # ⭐️ 추가
         )
-        hidden_states = plm_output.last_hidden_state  # [B*N, seq_len, 768]
+        # ⭐️ 8번째 레이어의 hidden states 사용 (hidden_states는 tuple: embedding + 8 layers)
+        hidden_states = plm_output.hidden_states[8]  # [B*N, seq_len, 768]
 
         # 3. Pooling
-        news_repr = self._pool_hidden_states(hidden_states, title_mask)  # [B*N, 768]
+        news_repr = self._pool_hidden_states(hidden_states, title_mask)  # [B*N, 400]
+
+        # ⭐ 추가: Dimension reduction
+        news_repr = self.reduce_dim(news_repr)  # [B*N, 64]
         news_repr = self.dropout(news_repr)
-        news_repr = news_repr.view([batch_size, news_num, self.plm_hidden_dim])
+        news_repr = news_repr.view([batch_size, news_num, self.news_compression_dim])
 
         # 4. Feature fusion (category/subcategory concatenation)
-        news_representation = self.feature_fusion(news_repr, category, subCategory)  # [B, N, 768+50+50=868]
+        category_repr = self.dropout(self.category_embedding(category))           # [B, N, 50]
+        subCategory_repr = self.dropout(self.subCategory_embedding(subCategory))  # [B, N, 50]
+        news_representation = torch.cat([news_repr, category_repr, subCategory_repr], dim=2)  # [B, N, 868]
 
         return news_representation
 
@@ -716,6 +827,14 @@ class PLMMiner(PLMNewsEncoder):
     def __init__(self, config: Config, category_dict: dict):
         super(PLMMiner, self).__init__(config)
 
+        # ⭐ 추가: PLMMiner 전용 MHSA (768 → 768)
+        self.plm_multihead_attention = MultiHeadSelfAttention(
+            d_model=768,              # BERT hidden size
+            num_heads=24,             # 더 많은 헤드로 다양한 attention 패턴
+            head_dim=32,              # 24 × 32 = 768
+            dropout=config.dropout_rate
+        )
+
         # Category embeddings
         self.category_embedding = nn.Embedding(
             num_embeddings=config.category_num,
@@ -724,6 +843,10 @@ class PLMMiner(PLMNewsEncoder):
 
         # News embedding dimension
         self.news_embedding_dim = self.plm_hidden_dim
+
+        # PLMMiner needs its own attention for 768-dim (override parent's 400-dim attention)
+        if config.plm_pooling == 'attention':
+            self.plm_attention = Attention(self.plm_hidden_dim, config.attention_dim)
 
         # Store category_dict for GloVe initialization
         self.category_dict = category_dict
@@ -735,6 +858,10 @@ class PLMMiner(PLMNewsEncoder):
         # Default: random uniform initialization
         nn.init.uniform_(self.category_embedding.weight, -0.1, 0.1)
 
+        # Initialize PLM-specific attention
+        if hasattr(self, 'plm_attention'):
+            self.plm_attention.initialize()
+
         # GloVe initialization for category embeddings (if enabled)
         if self.use_category_glove:
             print("\n" + "="*60)
@@ -745,6 +872,46 @@ class PLMMiner(PLMNewsEncoder):
                 frozen=True  # 카테고리 임베딩은 훈련하면 안됨
             )
             print("="*60 + "\n")
+
+    def _pool_hidden_states(self, hidden_states, attention_mask):
+        """
+        Override: PLMMiner with MHSA to maintain 768-dim
+
+        Args:
+            hidden_states: [batch_news_num, seq_len, plm_hidden_dim] (768)
+            attention_mask: [batch_news_num, seq_len]
+
+        Returns:
+            news_embedding: [batch_news_num, plm_hidden_dim] (768)
+        """
+        # ⭐ MHSA 적용 (768 → 768)
+        mhsa_output = self.plm_multihead_attention(
+            hidden_states,   # Q
+            hidden_states,   # K
+            hidden_states,   # V
+            mask=attention_mask
+        )  # [B*N, seq_len, 768]
+
+        # Pooling
+        if self.pooling_method == 'cls':
+            # [CLS] 토큰의 representation 사용
+            news_embedding = mhsa_output[:, 0, :]  # [B*N, 768]
+
+        elif self.pooling_method == 'average':
+            # Attention mask를 고려한 평균
+            mask_expanded = attention_mask.unsqueeze(-1).expand(mhsa_output.size()).float()
+            sum_hidden = torch.sum(mhsa_output * mask_expanded, dim=1)
+            sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+            news_embedding = sum_hidden / sum_mask  # [B*N, 768]
+
+        elif self.pooling_method == 'attention':
+            # Attention pooling (use PLMMiner-specific attention for 768-dim)
+            news_embedding = self.plm_attention(mhsa_output, mask=attention_mask)  # [B*N, 768]
+
+        else:
+            raise ValueError(f'Unknown pooling method: {self.pooling_method}')
+
+        return news_embedding
 
     def forward(self, title_text, title_mask, title_entity, content_text, content_mask, content_entity, category, subCategory, user_embedding):
         """
@@ -768,11 +935,14 @@ class PLMMiner(PLMNewsEncoder):
 
         # 2. PLM encoding
         plm_output = self.plm(
-            input_ids=title_text,
-            attention_mask=title_mask,
-            return_dict=True
+            input_ids=title_text, # [B*N, seq_len]
+            attention_mask=title_mask, # [B*N, seq_len]
+            return_dict=True,
+            output_hidden_states=True  # ⭐ 추가: 모든 레이어 출력
         )
-        hidden_states = plm_output.last_hidden_state  # [B*N, seq_len, 768]
+        # ⭐ 8번째 레이어 사용 (PLMNR 원본 코드와 동일)
+        # hidden_states는 tuple: (embedding_output, layer1, ..., layer8)
+        hidden_states = plm_output.hidden_states[8]  # [B*N, seq_len, 768]
 
         # 3. Pooling
         news_repr = self._pool_hidden_states(hidden_states, title_mask)  # [B*N, 768]

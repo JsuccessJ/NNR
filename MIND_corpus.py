@@ -331,7 +331,7 @@ class MIND_Corpus:
             for entity in json.loads(title_entities):
                 WikidataId = entity['WikidataId']
                 for offset in entity['OccurrenceOffsets']:
-                    if offsets[offset] != -1 and WikidataId in self.entity_dict:
+                    if 0 <= offset < len(offsets) and offsets[offset] != -1 and WikidataId in self.entity_dict:
                         self.news_title_entity[index][offsets[offset]] = self.entity_dict[WikidataId]
             self.title_word_num += len(words)
             words = pat.findall(abstract.lower()) if config.tokenizer == 'MIND' else word_tokenize(abstract.lower())
@@ -355,7 +355,7 @@ class MIND_Corpus:
             for entity in json.loads(abstract_entities):
                 WikidataId = entity['WikidataId']
                 for offset in entity['OccurrenceOffsets']:
-                    if offsets[offset] != -1 and WikidataId in self.entity_dict:
+                    if 0 <= offset < len(offsets) and offsets[offset] != -1 and WikidataId in self.entity_dict:
                         self.news_abstract_entity[index][offsets[offset]] = self.entity_dict[WikidataId]
             self.abstract_word_num += len(words)
         self.news_title_mask[0][0] = 1    # for <PAD> news

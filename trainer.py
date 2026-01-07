@@ -25,8 +25,36 @@ class Trainer:
         self.max_history_num = config.max_history_num
         self.negative_sample_num = config.negative_sample_num
         self.loss = self.negative_log_softmax if config.click_predictor in ['dot_product', 'mlp', 'FIM'] else self.negative_log_sigmoid
-        self.optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=config.lr, weight_decay=config.weight_decay)
-        
+
+        # PLM 기반 모델의 경우 learning rate 분리
+        if config.use_plm_news_encoder:
+            # PLM 파라미터와 나머지 파라미터 분리
+            plm_params = []
+            other_params = []
+
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    if 'plm' in name:  # PLM 파라미터
+                        plm_params.append(param)
+                    else:  # 다른 파라미터 (category embedding, attention 등)
+                        other_params.append(param)
+
+            # 서로 다른 learning rate 설정
+            self.optimizer = optim.Adam([
+                {'params': plm_params, 'lr': config.plm_lr},      # 1e-5 (PLM)
+                {'params': other_params, 'lr': config.lr}         # 1e-4 (기타)
+            ], weight_decay=config.weight_decay)
+
+            print(f'[Single-GPU] PLM parameters: {len(plm_params)}, Other parameters: {len(other_params)}')
+            print(f'[Single-GPU] PLM lr: {config.plm_lr}, Other lr: {config.lr}')
+        else:
+            # 기존 방식 (non-PLM 모델)
+            self.optimizer = optim.Adam(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=config.lr,
+                weight_decay=config.weight_decay
+            )
+
         self._dataset = config.dataset
         self.mind_corpus = mind_corpus
         self.train_dataset = MIND_Train_Dataset(mind_corpus)
@@ -231,16 +259,54 @@ def negative_log_sigmoid(logits):
 def distributed_train(rank, model: nn.Module, config: Config, mind_corpus: MIND_Corpus, run_index: int):
     world_size = config.world_size
     model_name = model.model_name
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+
+    # NCCL 초기화 (timeout 사실상 무한대로 설정)
+    import os
+    os.environ['NCCL_BLOCKING_WAIT'] = '0'  # Non-blocking wait
+    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'  # Async error handling
+
+    import datetime
+    # Dev 평가 시간 예측 불가 → timeout 매우 크게 (24시간)
+    timeout = datetime.timedelta(days=1)
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank, timeout=timeout)
     config.device_id = rank
     config.set_cuda()
     model.cuda()
     loss_ = negative_log_softmax if config.click_predictor in ['dot_product', 'mlp', 'FIM'] else negative_log_sigmoid
     epoch = config.epoch
     batch_size = config.batch_size // world_size
-    model = DDP(model, device_ids=[rank])
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.module.parameters()), lr=config.lr, weight_decay=config.weight_decay)
-    
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+
+    # PLM 기반 모델의 경우 learning rate 분리
+    if config.use_plm_news_encoder:
+        # PLM 파라미터와 나머지 파라미터 분리
+        plm_params = []
+        other_params = []
+
+        for name, param in model.module.named_parameters():
+            if param.requires_grad:
+                if 'plm' in name:  # PLM 파라미터
+                    plm_params.append(param)
+                else:  # 다른 파라미터 (category embedding, attention 등)
+                    other_params.append(param)
+
+        # 서로 다른 learning rate 설정
+        optimizer = optim.Adam([
+            {'params': plm_params, 'lr': config.plm_lr},      # 1e-5 (PLM)
+            {'params': other_params, 'lr': config.lr}         # 1e-4 (기타)
+        ], weight_decay=config.weight_decay)
+
+        if rank == 0:
+            print(f'[Multi-GPU] PLM parameters: {len(plm_params)}, Other parameters: {len(other_params)}')
+            print(f'[Multi-GPU] PLM lr: {config.plm_lr}, Other lr: {config.lr}')
+    else:
+        # 기존 방식 (non-PLM 모델)
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, model.module.parameters()),
+            lr=config.lr,
+            weight_decay=config.weight_decay
+        )
+
     # LR Scheduler (10% warmup + linear decay)
     from transformers import get_linear_schedule_with_warmup
     train_dataset = MIND_Train_Dataset(mind_corpus)
@@ -347,9 +413,14 @@ def distributed_train(rank, model: nn.Module, config: Config, mind_corpus: MIND_
         print('rank %d : Epoch %d : train done' % (rank, e))
         print('rank %d : loss = %.6f' % (rank, epoch_loss / len(train_dataset) * world_size))
 
-        # dev
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        # dev (rank 0만 수행, rank 1은 다음 epoch 준비)
         if rank == 0:
-            auc, mrr, ndcg5, ndcg10 = compute_scores(model.module, mind_corpus, batch_size * 3 // 2, 'dev', dev_res_dir + '/' + model_name + '-' + str(e) + '.txt', config.dataset)
+            # Dev 배치사이즈를 더 크게 (속도 향상)
+            dev_batch_size = batch_size * 4  # 메모리 고려하여 4배로 설정
+            auc, mrr, ndcg5, ndcg10 = compute_scores(model.module, mind_corpus, dev_batch_size, 'dev', dev_res_dir + '/' + model_name + '-' + str(e) + '.txt', config.dataset)
             auc_results.append(auc)
             mrr_results.append(mrr)
             ndcg5_results.append(ndcg5)
@@ -417,9 +488,22 @@ def distributed_train(rank, model: nn.Module, config: Config, mind_corpus: MIND_
             torch.cuda.empty_cache()
             if epoch_not_increase == 0:
                 torch.save({model_name: model.module.state_dict()}, model_dir + '/' + model_name + '-' + str(best_dev_epoch))
-            elif epoch_not_increase > early_stopping_epoch:
-                break
+
+            # Early stopping 결정을 텐서에 저장
+            early_stop_signal = torch.tensor([1 if epoch_not_increase > early_stopping_epoch else 0],
+                                            dtype=torch.int32, device='cuda')
+        else:
+            # Rank 1은 빈 텐서 생성
+            early_stop_signal = torch.tensor([0], dtype=torch.int32, device='cuda')
+
+        # 다음 epoch 시작 전 동기화 및 early stopping 체크
         dist.barrier()
+        dist.broadcast(early_stop_signal, src=0)
+
+        if early_stop_signal[0] == 1:
+            if rank == 0:
+                print(f'Early stopping at epoch {e}')
+            break
 
     if rank == 0:
         with open('%s/%s-%s-dev_log.txt' % (dev_res_dir, model_name, config.dataset), 'w', encoding='utf-8') as f:

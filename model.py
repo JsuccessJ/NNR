@@ -131,8 +131,14 @@ class Model(nn.Module):
                       news_category, news_subCategory, news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity):
         user_embedding = self.dropout(self.user_embedding(user_ID)) if self.use_user_embedding else None                                                                                                         # [batch_size, news_embedding_dim]
         news_representation = self.news_encoder(news_title_text, news_title_mask, news_title_entity, news_content_text, news_content_mask, news_content_entity, news_category, news_subCategory, user_embedding) # [batch_size, 1 + negative_sample_num, news_embedding_dim]
-        user_representation = self.user_encoder(user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_category, user_subCategory, \
-                                                user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, news_representation, news_category)                           # [batch_size, 1 + negative_sample_num, news_embedding_dim]
+
+        # MINER user encoder requires news_category for category-aware attention
+        if self.user_encoder.__class__.__name__ == 'MINER':
+            user_representation = self.user_encoder(user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_category, user_subCategory, \
+                                                    user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, news_representation, news_category)
+        else:
+            user_representation = self.user_encoder(user_title_text, user_title_mask, user_title_entity, user_content_text, user_content_mask, user_content_entity, user_category, user_subCategory, \
+                                                    user_history_mask, user_history_graph, user_history_category_mask, user_history_category_indices, user_embedding, news_representation)                           # [batch_size, 1 + negative_sample_num, news_embedding_dim]
         if self.click_predictor == 'dot_product':
             logits = (user_representation * news_representation).sum(dim=2) # dot-product
         elif self.click_predictor == 'mlp':
