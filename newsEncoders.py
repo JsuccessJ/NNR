@@ -827,26 +827,24 @@ class PLMMiner(PLMNewsEncoder):
     def __init__(self, config: Config, category_dict: dict):
         super(PLMMiner, self).__init__(config)
 
-        # ⭐ 추가: PLMMiner 전용 MHSA (768 → 768)
-        self.plm_multihead_attention = MultiHeadSelfAttention(
-            d_model=768,              # BERT hidden size
-            num_heads=24,             # 더 많은 헤드로 다양한 attention 패턴
-            head_dim=32,              # 24 × 32 = 768
-            dropout=config.dropout_rate
+        # Use parent's MHSA (768 → 400, heads=20×20)
+        # No need to override - parent class already has it
+
+        # Dimension reduction: 400 → 164 (same as PLMNAML final dimension)
+        self.news_compression_dim = 164
+        self.reduce_dim = nn.Linear(
+            config.head_num * config.head_dim,  # 400
+            self.news_compression_dim           # 164
         )
 
-        # Category embeddings
+        # Category embeddings (for MINER's category-aware attention)
         self.category_embedding = nn.Embedding(
             num_embeddings=config.category_num,
             embedding_dim=config.category_embedding_dim
         )
 
-        # News embedding dimension
-        self.news_embedding_dim = self.plm_hidden_dim
-
-        # PLMMiner needs its own attention for 768-dim (override parent's 400-dim attention)
-        if config.plm_pooling == 'attention':
-            self.plm_attention = Attention(self.plm_hidden_dim, config.attention_dim)
+        # News embedding dimension (164, no category concat needed for MINER)
+        self.news_embedding_dim = self.news_compression_dim  # 164
 
         # Store category_dict for GloVe initialization
         self.category_dict = category_dict
@@ -855,12 +853,12 @@ class PLMMiner(PLMNewsEncoder):
     def initialize(self):
         super().initialize()
 
-        # Default: random uniform initialization
-        nn.init.uniform_(self.category_embedding.weight, -0.1, 0.1)
+        # Initialize dimension reduction layer
+        nn.init.xavier_uniform_(self.reduce_dim.weight)
+        nn.init.zeros_(self.reduce_dim.bias)
 
-        # Initialize PLM-specific attention
-        if hasattr(self, 'plm_attention'):
-            self.plm_attention.initialize()
+        # Default: random uniform initialization for category embeddings
+        nn.init.uniform_(self.category_embedding.weight, -0.1, 0.1)
 
         # GloVe initialization for category embeddings (if enabled)
         if self.use_category_glove:
@@ -872,46 +870,6 @@ class PLMMiner(PLMNewsEncoder):
                 frozen=True  # 카테고리 임베딩은 훈련하면 안됨
             )
             print("="*60 + "\n")
-
-    def _pool_hidden_states(self, hidden_states, attention_mask):
-        """
-        Override: PLMMiner with MHSA to maintain 768-dim
-
-        Args:
-            hidden_states: [batch_news_num, seq_len, plm_hidden_dim] (768)
-            attention_mask: [batch_news_num, seq_len]
-
-        Returns:
-            news_embedding: [batch_news_num, plm_hidden_dim] (768)
-        """
-        # ⭐ MHSA 적용 (768 → 768)
-        mhsa_output = self.plm_multihead_attention(
-            hidden_states,   # Q
-            hidden_states,   # K
-            hidden_states,   # V
-            mask=attention_mask
-        )  # [B*N, seq_len, 768]
-
-        # Pooling
-        if self.pooling_method == 'cls':
-            # [CLS] 토큰의 representation 사용
-            news_embedding = mhsa_output[:, 0, :]  # [B*N, 768]
-
-        elif self.pooling_method == 'average':
-            # Attention mask를 고려한 평균
-            mask_expanded = attention_mask.unsqueeze(-1).expand(mhsa_output.size()).float()
-            sum_hidden = torch.sum(mhsa_output * mask_expanded, dim=1)
-            sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-            news_embedding = sum_hidden / sum_mask  # [B*N, 768]
-
-        elif self.pooling_method == 'attention':
-            # Attention pooling (use PLMMiner-specific attention for 768-dim)
-            news_embedding = self.plm_attention(mhsa_output, mask=attention_mask)  # [B*N, 768]
-
-        else:
-            raise ValueError(f'Unknown pooling method: {self.pooling_method}')
-
-        return news_embedding
 
     def forward(self, title_text, title_mask, title_entity, content_text, content_mask, content_entity, category, subCategory, user_embedding):
         """
@@ -944,11 +902,15 @@ class PLMMiner(PLMNewsEncoder):
         # hidden_states는 tuple: (embedding_output, layer1, ..., layer8)
         hidden_states = plm_output.hidden_states[8]  # [B*N, seq_len, 768]
 
-        # 3. Pooling
-        news_repr = self._pool_hidden_states(hidden_states, title_mask)  # [B*N, 768]
-        news_repr = self.dropout(news_repr)
-        news_repr = news_repr.view([batch_size, news_num, self.plm_hidden_dim])
+        # 3. Pooling (use parent's implementation: 768 → MHSA → 400)
+        news_repr = self._pool_hidden_states(hidden_states, title_mask)  # [B*N, 400]
 
-        return news_repr
+        # 4. Dimension reduction (400 → 164)
+        news_repr = self.reduce_dim(news_repr)  # [B*N, 164]
+        news_repr = self.dropout(news_repr)
+        news_repr = news_repr.view([batch_size, news_num, self.news_compression_dim])  # [B, N, 164]
+
+        # No category concatenation - MINER uses category as attention bias
+        return news_repr  # [B, N, 164]
 
 
